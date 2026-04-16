@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>V2.1 Multi-Crypto — Frequency Optimized Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+    <header>
+        <h1>&#9889; Multi-Crypto Dashboard — V2.1 (Frequency Optimized)</h1>
+        <nav>
+            <button class="nav-btn active" onclick="showPage('live')">Live Trading</button>
+            <button class="nav-btn" onclick="showPage('performance')">Performance</button>
+            <button class="nav-btn" onclick="showPage('comparison')">V1 vs V2.1</button>
+        </nav>
+    </header>
+
+    <!-- ═══════════════ PAGE 1: LIVE TRADING ═══════════════ -->
+    <section id="page-live" class="page active">
+        <div class="controls-bar">
+            <button onclick="startTrader()">Start Trader</button>
+            <button onclick="stopTrader()">Stop Trader</button>
+            <span id="live-status" class="status-text"></span>
+        </div>
+
+        <!-- Trading Mode & Safety Controls -->
+        <div class="info-box" style="background:#1a1a2e;border:2px solid #444;margin-bottom:15px;">
+            <h3>&#9881; Trading Mode</h3>
+            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                <span id="mode-badge" style="font-size:18px;font-weight:bold;padding:5px 15px;border-radius:5px;background:#333;">PAPER</span>
+                <button onclick="switchMode('paper')" class="mode-btn" id="btn-paper" style="background:#4caf50;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;">Paper</button>
+                <button onclick="switchMode('shadow')" class="mode-btn" id="btn-shadow" style="background:#ff9800;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;">Shadow ($1)</button>
+                <button onclick="switchMode('live')" class="mode-btn" id="btn-live" style="background:#f44336;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;">Live</button>
+                <span style="margin-left:20px;color:#888;">|</span>
+                <button onclick="activateKillSwitch()" id="btn-kill" style="background:#d32f2f;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;">&#9888; KILL SWITCH</button>
+                <button onclick="deactivateKillSwitch()" id="btn-unkill" style="background:#666;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer;">Deactivate Kill</button>
+            </div>
+            <div id="mode-info" style="margin-top:8px;color:#aaa;font-size:13px;">Mode: paper | Trader ready: —</div>
+        </div>
+
+        <!-- Safety Panel -->
+        <div class="info-box" style="background:#1a1a2e;border:1px solid #555;margin-bottom:15px;">
+            <h3>&#128737; Safety Status</h3>
+            <div id="safety-panel" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;">
+                <div><span style="color:#888;">Daily P&amp;L:</span> <span id="sf-daily-pnl">$0.00</span></div>
+                <div><span style="color:#888;">Daily Limit:</span> <span id="sf-daily-limit">$15.00</span></div>
+                <div><span style="color:#888;">Consec Losses:</span> <span id="sf-consec">0/5</span></div>
+                <div><span style="color:#888;">Open Positions:</span> <span id="sf-positions">0/3</span></div>
+                <div><span style="color:#888;">Halted:</span> <span id="sf-halted">No</span></div>
+                <div><span style="color:#888;">Kill Switch:</span> <span id="sf-kill">Off</span></div>
+                <div><span style="color:#888;">Wallet:</span> <span id="sf-wallet">—</span></div>
+                <div><span style="color:#888;">Real P&amp;L:</span> <span id="sf-real-pnl">$0.00</span></div>
+            </div>
+            <div style="margin-top:8px;">
+                <button onclick="unhaltBot()" style="background:#ff9800;color:#fff;border:none;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px;">Unhalt Bot</button>
+                <span id="sf-last-reason" style="margin-left:10px;color:#f44336;font-size:12px;"></span>
+            </div>
+        </div>
+
+        <!-- Summary cards -->
+        <div class="card-grid" id="live-summary">
+            <div class="card"><div class="card-label">Bankroll</div><div class="card-value" id="s-bankroll">—</div></div>
+            <div class="card"><div class="card-label">Total Trades</div><div class="card-value" id="s-trades">—</div></div>
+            <div class="card"><div class="card-label">Win Rate</div><div class="card-value" id="s-winrate">—</div></div>
+            <div class="card"><div class="card-label">P&amp;L</div><div class="card-value" id="s-pnl">—</div></div>
+            <div class="card"><div class="card-label">Trade Rate</div><div class="card-value" id="s-rate">—</div></div>
+            <div class="card"><div class="card-label">Crypto Prices</div><div class="card-value" id="s-btc" style="font-size:11px;white-space:pre-line;">—</div></div>
+            <div class="card"><div class="card-label">Status</div><div class="card-value" id="s-status">—</div></div>
+            <div class="card"><div class="card-label">Hours Running</div><div class="card-value" id="s-hours">—</div></div>
+        </div>
+
+        <!-- Market Coverage Panel -->
+        <div class="info-box">
+            <h3>&#128640; Market Coverage</h3>
+            <div id="coverage-detail">Loading...</div>
+        </div>
+
+        <!-- Discovery Speed Panel -->
+        <div class="info-box">
+            <h3>&#128269; Discovery Speed</h3>
+            <div id="discovery-detail">Loading...</div>
+        </div>
+
+        <!-- Entry Quality Panel -->
+        <div class="info-box">
+            <h3>&#127919; Entry Quality</h3>
+            <div id="entry-detail">Loading...</div>
+        </div>
+
+
+        <!-- Crypto P&L Breakdown -->
+        <div class="info-box">
+            <h3>&#128176; Crypto P&amp;L Breakdown</h3>
+            <div id="crypto-pnl-panel">Loading...</div>
+        </div>
+        <!-- Active Markets -->
+        <div class="info-box">
+            <h3>Active Markets</h3>
+            <div id="active-markets">No active markets</div>
+        </div>
+
+        <!-- Active Positions -->
+        <div class="info-box">
+            <h3>Open Positions</h3>
+            <div id="active-positions">No open positions</div>
+        </div>
+
+        <!-- Equity Curve -->
+        <div class="chart-container">
+            <h3>Equity Curve</h3>
+            <canvas id="equity-chart"></canvas>
+        </div>
+
+        <!-- Trade Table -->
+        <div class="table-container">
+            <h3>Trade History</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>#</th><th>Market</th><th>TF</th><th>Side</th>
+                        <th>Entry</th><th>Est.Prob</th><th>Outcome</th>
+                        <th>Result</th><th>P&amp;L</th><th>Bankroll</th>
+                        <th>t-remain</th><th>Source</th>
+                    </tr>
+                </thead>
+                <tbody id="trade-tbody"></tbody>
+            </table>
+        </div>
+    </section>
+
+    <!-- ═══════════════ PAGE 2: PERFORMANCE ═══════════════ -->
+    <section id="page-performance" class="page">
+        <h2 style="color:var(--accent-orange);margin-bottom:16px;">Performance Logs — Every Market Window</h2>
+
+        <!-- Summary Stats -->
+        <div class="card-grid" id="perf-summary">
+            <div class="card"><div class="card-label">Windows Logged</div><div class="card-value" id="p-windows">—</div></div>
+            <div class="card"><div class="card-label">Qualified</div><div class="card-value" id="p-qualified">—</div></div>
+            <div class="card"><div class="card-label">Traded</div><div class="card-value" id="p-traded">—</div></div>
+            <div class="card"><div class="card-label">Coverage %</div><div class="card-value" id="p-coverage">—</div></div>
+            <div class="card"><div class="card-label">Avg Discovery</div><div class="card-value" id="p-disc">—</div></div>
+            <div class="card"><div class="card-label">Predicted</div><div class="card-value" id="p-predicted">—</div></div>
+        </div>
+
+        <!-- Performance Table -->
+        <div class="table-container">
+            <h3>Market Window Log (most recent first)</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Slug</th><th>TF</th><th>Source</th>
+                        <th>Disc.&nbsp;ms</th><th>Qualified</th>
+                        <th>Best Price</th><th>Entry Price</th>
+                        <th>Traded</th><th>Outcome</th><th>Missed Reason</th>
+                    </tr>
+                </thead>
+                <tbody id="perf-tbody"></tbody>
+            </table>
+        </div>
+    </section>
+
+    <!-- ═══════════════ PAGE 3: V1 vs V2.1 COMPARISON ═══════════════ -->
+    <section id="page-comparison" class="page">
+        <h2 style="color:var(--accent-orange);margin-bottom:16px;">V1 (8081) vs V2.1 (8085) — Side by Side</h2>
+
+        <div class="table-container">
+            <table id="cmp-table">
+                <thead>
+                    <tr><th>Metric</th><th>V1 (8081)</th><th>V2.1 (8085)</th><th>Improvement</th></tr>
+                </thead>
+                <tbody id="cmp-tbody">
+                    <tr><td>Total Trades</td><td id="c1-trades">—</td><td id="c2-trades">—</td><td id="ci-trades">—</td></tr>
+                    <tr><td>Win Rate</td><td id="c1-wr">—</td><td id="c2-wr">—</td><td id="ci-wr">—</td></tr>
+                    <tr><td>Bankroll</td><td id="c1-br">—</td><td id="c2-br">—</td><td id="ci-br">—</td></tr>
+                    <tr><td>Profit</td><td id="c1-pnl">—</td><td id="c2-pnl">—</td><td id="ci-pnl">—</td></tr>
+                    <tr><td>Trade Rate (/hr)</td><td id="c1-rate">—</td><td id="c2-rate">—</td><td id="ci-rate">—</td></tr>
+                    <tr><td>Avg Entry Price</td><td id="c1-entry">—</td><td id="c2-entry">—</td><td id="ci-entry">—</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <script>
+    // ── Navigation ──
+    function showPage(name) {
+        document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+        document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+        document.getElementById('page-' + name).classList.add('active');
+        event.target.classList.add('active');
+        if (name === 'performance') loadPerformance();
+        if (name === 'comparison') loadComparison();
+    }
+
+    // ── Charts ──
+    let equityChart = null;
+
+    function initCharts() {
+        const chartOpts = {
+            responsive: true, maintainAspectRatio: false,
+            plugins: { legend: { labels: { color: '#a0aec0' } } },
+            scales: {
+                x: { ticks: { color: '#718096' }, grid: { color: '#2d3748' } },
+                y: { ticks: { color: '#718096' }, grid: { color: '#2d3748' } }
+            }
+        };
+        equityChart = new Chart(document.getElementById('equity-chart'), {
+            type: 'line',
+            data: { labels: [], datasets: [{
+                label: 'Bankroll ($)', data: [],
+                borderColor: '#48bb78', backgroundColor: 'rgba(72,187,120,0.1)',
+                fill: true, tension: 0.1, pointRadius: 1
+            }]},
+            options: chartOpts
+        });
+    }
+
+    // ── Refresh Live State ──
+    async function refreshState() {
+        try {
+            const resp = await fetch('/api/paper/state');
+            const s = await resp.json();
+            if (s.message) return;
+
+            document.getElementById('s-bankroll').textContent = '$' + (s.bankroll||0).toFixed(2);
+            document.getElementById('s-trades').textContent = s.total_trades || 0;
+            document.getElementById('s-winrate').textContent = (s.win_rate||0) + '%';
+            const pnl = s.total_profit || 0;
+            document.getElementById('s-pnl').textContent = '$' + pnl.toFixed(2);
+            document.getElementById('s-pnl').className = 'card-value ' + (pnl >= 0 ? 'positive' : 'negative');
+            document.getElementById('s-rate').textContent = (s.trade_rate_per_hour||0) + '/hr';
+            // Multi-crypto prices display
+            if (s.crypto_prices && Object.keys(s.crypto_prices).length > 0) {
+                let priceLines = [];
+                for (const [key, price] of Object.entries(s.crypto_prices)) {
+                    const name = key.toUpperCase();
+                    if (price > 100) priceLines.push(name + ' $' + price.toLocaleString(undefined, {maximumFractionDigits: 0}));
+                    else priceLines.push(name + ' $' + price.toFixed(4));
+                }
+                document.getElementById('s-btc').innerHTML = priceLines.join('<br>');
+            } else {
+                document.getElementById('s-btc').textContent = s.btc_price ? '$' + s.btc_price.toFixed(2) : '—';
+            }
+            document.getElementById('s-status').textContent = s.is_running ? 'RUNNING' : 'STOPPED';
+            document.getElementById('s-status').className = 'card-value ' + (s.is_running ? 'positive' : 'negative');
+            if (typeof updateModeUI === 'function') updateModeUI(s);
+            document.getElementById('s-hours').textContent = (s.hours_running||0).toFixed(1) + 'h';
+
+            // Market Coverage
+            const cov = s.coverage || {};
+            document.getElementById('coverage-detail').innerHTML =
+                `Tracking <strong>${s.tracked_markets||0}</strong> active markets | ` +
+                `Traded <strong>${cov.markets_traded||0}</strong> / <strong>${cov.markets_qualified||0}</strong> qualifying markets ` +
+                `(<strong>${cov.coverage_pct||0}%</strong>) | ` +
+                `Discovered <strong>${cov.markets_discovered||0}</strong> total`;
+
+            // Discovery Speed
+            const disc = s.discovery || {};
+            document.getElementById('discovery-detail').innerHTML =
+                `Avg discovery delay: <strong>${disc.avg_discovery_ms||0}ms</strong> | ` +
+                `Predicted: <strong>${disc.predicted||0}</strong> | ` +
+                `Fallback: <strong>${disc.fallback||0}</strong>`;
+
+            // Entry Quality
+            const eq = s.entry_quality || {};
+            document.getElementById('entry-detail').innerHTML =
+                `Avg entry price: <strong>${(eq.avg_entry_price||0).toFixed(4)}</strong> | ` +
+                `Best: <strong>${(eq.best_entry_price||0).toFixed(4)}</strong> | ` +
+                `Entries below 0.70: <strong>${eq.entries_below_070||0}</strong> | ` +
+                `Entries below 0.80: <strong>${eq.entries_below_080||0}</strong>`;
+
+            // Active Markets
+            const tracking = s.tracking || [];
+            if (tracking.length > 0) {
+                let html = '<table style="width:100%;font-size:12px;"><tr><th>Crypto</th><th>Slug</th><th>TF</th><th>Time Left</th><th>Position</th><th>Source</th></tr>';
+                tracking.forEach(m => {
+                    html += `<tr>
+                        <td>${(m.crypto_name || 'BTC')}</td>
+                        <td class="slug">${m.slug}</td>
+                        <td>${m.tf}</td>
+                        <td>${m.time_remaining}s</td>
+                        <td>${m.has_position ? '✅' : '—'}</td>
+                        <td>${m.discovery_source}</td>
+                    </tr>`;
+                });
+                html += '</table>';
+                document.getElementById('active-markets').innerHTML = html;
+            } else {
+                document.getElementById('active-markets').textContent = 'No active markets';
+            }
+
+            // Active Positions
+            const pos = s.active_positions || [];
+            if (pos.length > 0) {
+                let html = '<table style="width:100%;font-size:12px;"><tr><th>Slug</th><th>Side</th><th>Entry</th><th>Bet</th><th>Time Left</th><th>Via</th></tr>';
+                pos.forEach(p => {
+                    html += `<tr>
+                        <td class="slug">${p.slug}</td>
+                        <td>${p.side}</td>
+                        <td>${p.entry_price.toFixed(3)}</td>
+                        <td>$${p.bet_amount.toFixed(2)}</td>
+                        <td>${p.time_remaining}s</td>
+                        <td>${p.entry_source}</td>
+                    </tr>`;
+                });
+                html += '</table>';
+                document.getElementById('active-positions').innerHTML = html;
+            } else {
+                document.getElementById('active-positions').textContent = 'No open positions';
+            }
+
+            
+            // Crypto P&L Breakdown
+            const cryptoPnl = s.crypto_pnl || {};
+            if (Object.keys(cryptoPnl).length > 0) {
+                let pnlHtml = '<table style="width:100%;font-size:12px;"><tr><th>Crypto</th><th>Trades</th><th>W/L</th><th>Win Rate</th><th>P&L</th></tr>';
+                for (const [key, cp] of Object.entries(cryptoPnl)) {
+                    if (cp.trades > 0) {
+                        const cls = cp.pnl >= 0 ? 'positive' : 'negative';
+                        pnlHtml += `<tr><td><strong>${cp.name}</strong></td><td>${cp.trades}</td><td>${cp.wins}/${cp.losses}</td><td>${cp.win_rate}%</td><td class="${cls}">$${cp.pnl.toFixed(4)}</td></tr>`;
+                    }
+                }
+                pnlHtml += '</table>';
+                document.getElementById('crypto-pnl-panel').innerHTML = pnlHtml;
+            } else {
+                document.getElementById('crypto-pnl-panel').textContent = 'No trades yet';
+            }
+
+            // Trade Table
+            const tbody = document.getElementById('trade-tbody');
+            tbody.innerHTML = '';
+            (s.recent_trades || []).slice().reverse().forEach((t, i) => {
+                const tfMatch = t.market_slug.match(/-updown-(\w+)-/); const tf = tfMatch ? tfMatch[1] : '5m';
+                const shortSlug = t.market_slug.replace(/^(btc|eth|sol|xrp|doge|bnb)-updown-(\w+)-/, (m,c,tf) => c.toUpperCase()+'/'+tf+':');
+                const row = document.createElement('tr');
+                row.className = t.won ? 'win-row' : 'loss-row';
+                const cryptoName = t.crypto_name || 'Bitcoin';
+                row.innerHTML = `
+                    <td>${i+1}</td>
+                    <td>${cryptoName}</td>
+                    <td class="slug">${shortSlug}</td>
+                    <td>${tf}</td>
+                    <td>${t.side}</td>
+                    <td>${t.entry_price.toFixed(3)}</td>
+                    <td>${t.estimated_prob.toFixed(3)}</td>
+                    <td>${t.actual_outcome}</td>
+                    <td class="${t.won ? 'positive' : 'negative'}">${t.won ? 'WIN' : 'LOSS'}</td>
+                    <td class="${t.net_profit >= 0 ? 'positive' : 'negative'}">$${t.net_profit.toFixed(4)}</td>
+                    <td>$${t.bankroll_after.toFixed(2)}</td>
+                    <td>${t.time_remaining}s</td>
+                    <td>${t.entry_source || '—'}</td>
+                `;
+                tbody.appendChild(row);
+            });
+
+            // Equity Curve
+            const ec = await (await fetch('/api/paper/equity-curve')).json();
+            if (ec.labels && ec.labels.length > 0) {
+                equityChart.data.labels = ec.labels;
+                equityChart.data.datasets[0].data = ec.data;
+                equityChart.update();
+            }
+        } catch (e) {
+            console.error('Refresh error:', e);
+        }
+    }
+
+    // ── Performance Page ──
+    async function loadPerformance() {
+        try {
+            const resp = await fetch('/api/performance');
+            const entries = await resp.json();
+
+            const qualified = entries.filter(e => e.qualified).length;
+            const traded = entries.filter(e => e.traded).length;
+            const avgDisc = entries.length > 0
+                ? entries.reduce((s,e) => s + (e.discovery_delay_ms||0), 0) / entries.length
+                : 0;
+            const predicted = entries.filter(e => (e.discovery_source||'').startsWith('predicted')).length;
+
+            document.getElementById('p-windows').textContent = entries.length;
+            document.getElementById('p-qualified').textContent = qualified;
+            document.getElementById('p-traded').textContent = traded;
+            document.getElementById('p-coverage').textContent = qualified > 0
+                ? (traded / qualified * 100).toFixed(1) + '%' : '—';
+            document.getElementById('p-disc').textContent = avgDisc.toFixed(0) + 'ms';
+            document.getElementById('p-predicted').textContent = predicted + '/' + entries.length;
+
+            const tbody = document.getElementById('perf-tbody');
+            tbody.innerHTML = '';
+            entries.slice().reverse().forEach(e => {
+                const row = document.createElement('tr');
+                row.className = e.traded ? (e.won ? 'win-row' : 'loss-row') : '';
+                const shortSlug = (e.market_slug||'').replace(/^(btc|eth|sol|xrp|doge|bnb)-updown-(\w+)-/, (m,c,tf) => c.toUpperCase()+'/'+tf+':');
+                row.innerHTML = `
+                    <td class="slug">${shortSlug}</td>
+                    <td>${e.tf||'—'}</td>
+                    <td>${e.discovery_source||'—'}</td>
+                    <td>${(e.discovery_delay_ms||0).toFixed(0)}</td>
+                    <td>${e.qualified ? '✅' : '❌'}</td>
+                    <td>${e.best_entry_price ? e.best_entry_price.toFixed(3) : '—'}</td>
+                    <td>${e.actual_entry_price ? e.actual_entry_price.toFixed(3) : '—'}</td>
+                    <td>${e.traded ? '✅' : '❌'}</td>
+                    <td>${e.actual_outcome||'—'}</td>
+                    <td>${e.missed_reason||'—'}</td>
+                `;
+                tbody.appendChild(row);
+            });
+        } catch (e) {
+            console.error('Perf load error:', e);
+        }
+    }
+
+    // ── Comparison Page ──
+    async function loadComparison() {
+        try {
+            const resp = await fetch('/api/comparison');
+            const d = await resp.json();
+            const v1 = d.v1 || {};
+            const v2 = d.v21 || {};
+
+            document.getElementById('c1-trades').textContent = v1.trades || 0;
+            document.getElementById('c2-trades').textContent = v2.trades || 0;
+            document.getElementById('ci-trades').innerHTML = improvement(v2.trades, v1.trades, 'x');
+
+            document.getElementById('c1-wr').textContent = (v1.win_rate||0) + '%';
+            document.getElementById('c2-wr').textContent = (v2.win_rate||0) + '%';
+            document.getElementById('ci-wr').innerHTML = improvement(v2.win_rate, v1.win_rate, 'pp');
+
+            document.getElementById('c1-br').textContent = '$' + (v1.bankroll||0).toFixed(2);
+            document.getElementById('c2-br').textContent = '$' + (v2.bankroll||0).toFixed(2);
+            document.getElementById('ci-br').innerHTML = improvement(v2.bankroll, v1.bankroll, '$');
+
+            document.getElementById('c1-pnl').textContent = '$' + (v1.profit||0).toFixed(2);
+            document.getElementById('c2-pnl').textContent = '$' + (v2.profit||0).toFixed(2);
+            document.getElementById('ci-pnl').innerHTML = improvement(v2.profit, v1.profit, '$');
+
+            document.getElementById('c1-rate').textContent = '—';
+            document.getElementById('c2-rate').textContent = (v2.trade_rate||0).toFixed(1);
+            document.getElementById('ci-rate').textContent = '—';
+
+            document.getElementById('c1-entry').textContent = '—';
+            document.getElementById('c2-entry').textContent = (v2.avg_entry||0).toFixed(4);
+            document.getElementById('ci-entry').textContent = '—';
+        } catch (e) {
+            console.error('Comparison error:', e);
+        }
+    }
+
+    function improvement(v2val, v1val, unit) {
+        if (!v1val || v1val === 0) return '—';
+        if (unit === 'x') {
+            const ratio = v2val / v1val;
+            const cls = ratio >= 1 ? 'positive' : 'negative';
+            return `<span class="${cls}">${ratio.toFixed(1)}x</span>`;
+        }
+        if (unit === 'pp') {
+            const diff = v2val - v1val;
+            const cls = diff >= 0 ? 'positive' : 'negative';
+            return `<span class="${cls}">${diff >= 0 ? '+' : ''}${diff.toFixed(1)}pp</span>`;
+        }
+        if (unit === '$') {
+            const diff = v2val - v1val;
+            const cls = diff >= 0 ? 'positive' : 'negative';
+            return `<span class="${cls}">${diff >= 0 ? '+' : ''}$${diff.toFixed(2)}</span>`;
+        }
+        return '—';
+    }
+
+    // ── Actions ──
+    async function startTrader() {
+        document.getElementById('live-status').textContent = 'Starting...';
+        await fetch('/api/paper/start', { method: 'POST' });
+        document.getElementById('live-status').textContent = 'Trader started!';
+        refreshState();
+    }
+    async function stopTrader() {
+        await fetch('/api/paper/stop', { method: 'POST' });
+        document.getElementById('live-status').textContent = 'Trader stopped.';
+        refreshState();
+    }
+
+    // ── Init ──
+    initCharts();
+    refreshState();
+    setInterval(refreshState, 5000);
+
+    // ── Trading Mode Controls ──────────────────────────────
+    async function switchMode(newMode) {
+        let body = {mode: newMode};
+        if (newMode === 'live') {
+            const confirm = prompt('Type CONFIRM to switch to LIVE trading with real money:');
+            if (confirm !== 'CONFIRM') { alert('Live mode cancelled.'); return; }
+            body.confirm = 'CONFIRM';
+        }
+        if (newMode === 'shadow') {
+            if (!window.confirm('Switch to SHADOW mode? ($1 real trades)')) return;
+        }
+        try {
+            const r = await fetch('/api/mode/switch', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+            const d = await r.json();
+            if (d.error) { alert('Error: ' + d.error); return; }
+            alert('Mode switched: ' + (d.old_mode||'?') + ' → ' + (d.new_mode||newMode));
+            refreshState();
+        } catch(e) { alert('Failed: ' + e); }
+    }
+
+    async function activateKillSwitch() {
+        if (!window.confirm('ACTIVATE KILL SWITCH? This will stop all trading and cancel open orders!')) return;
+        try {
+            await fetch('/api/kill-switch/activate', {method:'POST'});
+            alert('Kill switch ACTIVATED');
+            refreshState();
+        } catch(e) { alert('Failed: ' + e); }
+    }
+
+    async function deactivateKillSwitch() {
+        try {
+            await fetch('/api/kill-switch/deactivate', {method:'POST'});
+            alert('Kill switch deactivated');
+            refreshState();
+        } catch(e) { alert('Failed: ' + e); }
+    }
+
+    async function unhaltBot() {
+        try {
+            await fetch('/api/safety/unhalt', {method:'POST'});
+            alert('Bot unhalted');
+            refreshState();
+        } catch(e) { alert('Failed: ' + e); }
+    }
+
+    function updateModeUI(s) {
+        const mode = (s.mode || 'paper').toUpperCase();
+        const badge = document.getElementById('mode-badge');
+        if (badge) {
+            badge.textContent = mode;
+            badge.style.background = mode === 'PAPER' ? '#4caf50' : mode === 'SHADOW' ? '#ff9800' : '#f44336';
+        }
+        const info = document.getElementById('mode-info');
+        if (info) info.textContent = 'Mode: ' + mode + ' | Trader ready: ' + (s.trader_ready ? 'Yes' : 'No') + ' | Wallet: $' + (s.wallet_balance || 0).toFixed(2);
+
+        // Safety panel
+        const sf = s.safety || {};
+        const el = (id) => document.getElementById(id);
+        if (el('sf-daily-pnl')) el('sf-daily-pnl').textContent = '$' + (sf.daily_pnl || 0).toFixed(2);
+        if (el('sf-daily-limit')) el('sf-daily-limit').textContent = '$' + (sf.daily_loss_limit || 15).toFixed(2);
+        if (el('sf-consec')) el('sf-consec').textContent = (sf.consecutive_losses || 0) + '/' + (sf.max_consecutive_losses || 5);
+        if (el('sf-positions')) el('sf-positions').textContent = (sf.current_positions || 0) + '/' + (sf.max_concurrent_positions || 3);
+        if (el('sf-halted')) {
+            el('sf-halted').textContent = sf.is_halted ? 'YES — ' + (sf.halt_reason || '') : 'No';
+            el('sf-halted').style.color = sf.is_halted ? '#f44336' : '#4caf50';
+        }
+        if (el('sf-kill')) {
+            el('sf-kill').textContent = sf.kill_switch_active ? 'ACTIVE' : 'Off';
+            el('sf-kill').style.color = sf.kill_switch_active ? '#f44336' : '#4caf50';
+        }
+        if (el('sf-wallet')) el('sf-wallet').textContent = '$' + (s.wallet_balance || 0).toFixed(2);
+        if (el('sf-real-pnl')) {
+            const rp = s.real_pnl_total || 0;
+            el('sf-real-pnl').textContent = '$' + rp.toFixed(4);
+            el('sf-real-pnl').style.color = rp >= 0 ? '#4caf50' : '#f44336';
+        }
+        if (el('sf-last-reason')) el('sf-last-reason').textContent = sf.last_reason || '';
+    }
+    </script>
+</body>
+</html>

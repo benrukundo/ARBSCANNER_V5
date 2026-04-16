@@ -1,0 +1,140 @@
+/* V2.1 Frequency Optimized — Dark Financial Terminal Theme */
+:root {
+    --bg-primary: #0d1117;
+    --bg-secondary: #161b22;
+    --bg-card: #1c2333;
+    --border: #30363d;
+    --text-primary: #e6edf3;
+    --text-secondary: #8b949e;
+    --accent-green: #48bb78;
+    --accent-red: #fc8181;
+    --accent-orange: #f6ad55;
+    --accent-blue: #63b3ed;
+    --accent-purple: #b794f4;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 14px;
+    line-height: 1.6;
+}
+header {
+    background: var(--bg-secondary);
+    padding: 14px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+}
+header h1 { font-size: 18px; color: var(--accent-orange); }
+nav { display: flex; gap: 8px; }
+.nav-btn {
+    padding: 6px 16px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 13px;
+    transition: all 0.15s ease;
+}
+.nav-btn:hover { color: var(--text-primary); border-color: var(--accent-blue); }
+.nav-btn.active { background: var(--accent-blue); color: #fff; border-color: var(--accent-blue); }
+.page { display: none; padding: 20px 24px; }
+.page.active { display: block; }
+
+/* Controls bar */
+.controls-bar {
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 16px;
+}
+.controls-bar button {
+    padding: 8px 20px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.15s ease;
+}
+.controls-bar button:hover { border-color: var(--accent-green); color: var(--accent-green); }
+.status-text { color: var(--text-secondary); font-size: 13px; }
+
+/* Card grid */
+.card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+    margin-bottom: 16px;
+}
+.card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+    text-align: center;
+}
+.card-label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+.card-value { font-size: 20px; font-weight: 700; }
+
+/* info boxes */
+.info-box {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin-bottom: 12px;
+}
+.info-box h3 { font-size: 14px; color: var(--accent-orange); margin-bottom: 8px; }
+.info-box strong { color: var(--accent-blue); }
+
+/* Charts */
+.chart-container {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+    height: 300px;
+    position: relative;
+}
+.chart-container h3 { font-size: 14px; color: var(--accent-orange); margin-bottom: 8px; }
+.chart-container canvas { max-height: 250px; }
+
+/* Tables */
+.table-container {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-bottom: 16px;
+    overflow-x: auto;
+}
+.table-container h3 { font-size: 14px; color: var(--accent-orange); margin-bottom: 10px; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th {
+    background: var(--bg-secondary);
+    border-bottom: 2px solid var(--border);
+    padding: 8px 10px;
+    text-align: left;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.5px;
+}
+td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
+tr:hover { background: rgba(99, 179, 237, 0.04); }
+.win-row td { background: rgba(72, 187, 120, 0.06); }
+.loss-row td { background: rgba(252, 129, 129, 0.06); }
+
+/* Utility */
+.positive { color: var(--accent-green); }
+.negative { color: var(--accent-red); }
+.slug { font-size: 11px; color: var(--text-secondary); word-break: break-all; }
