@@ -94,6 +94,30 @@ class PolymarketTrader:
                 creds=api_creds,
             )
             self._initialized = True
+
+            # ── Fee support check (CRITICAL for crypto fee-enabled markets) ──
+            # Polymarket crypto markets require feeRateBps in signed orders.
+            # If py-clob-client is too old, orders WILL be rejected.
+            self._fee_supported = True
+            try:
+                import py_clob_client
+                clob_version = getattr(py_clob_client, "__version__", "0.0.0")
+                from packaging.version import Version
+                if Version(clob_version) < Version("0.15.0"):
+                    self._fee_supported = False
+                    logger.critical(
+                        "py-clob-client version %s is too old — feeRateBps not supported. "
+                        "Orders WILL be rejected on fee-enabled markets. "
+                        "Please upgrade: pip install --upgrade py-clob-client",
+                        clob_version
+                    )
+                else:
+                    logger.info("py-clob-client version %s — fee support OK", clob_version)
+            except ImportError:
+                logger.info("packaging not installed — skipping version check, assuming fee support OK")
+            except Exception as ve:
+                logger.warning("Fee version check failed: %s — assuming OK", ve)
+
             logger.info("PolymarketTrader initialized (CLOB client ready)")
 
         except Exception as e:
@@ -122,6 +146,33 @@ class PolymarketTrader:
                           price: float, market_slug: str = "") -> dict:
         """Place a FAK order on the CLOB."""
         from py_clob_client.clob_types import OrderArgs, OrderType
+
+
+        # ── CRITICAL: Verify fee support before placing any order ──
+        if hasattr(self, "_fee_supported") and not self._fee_supported:
+            logger.error("REFUSING to place order — py-clob-client too old for feeRateBps")
+            return {
+                "success": False,
+                "order_id": None,
+                "status": "fee_unsupported",
+                "error": "py-clob-client version too old for fee support",
+                "filled_size": 0,
+                "intended_size": size_usd,
+                "fill_ratio": 0,
+                "slippage": 0,
+            }
+
+        # Query current fee rate from CLOB API
+        try:
+            import httpx
+            fee_resp = httpx.get(
+                f"https://clob.polymarket.com/fee-rate?token_id={token_id}",
+                timeout=5,
+            )
+            fee_data = fee_resp.json()
+            logger.info("Fee rate for %s: %s", token_id[:16], fee_data)
+        except Exception as fe:
+            logger.warning("Fee rate query failed: %s — proceeding with order", fe)
 
         append_jsonl(TRADE_LOG, {
             "timestamp": time.time(),
@@ -161,8 +212,18 @@ class PolymarketTrader:
             signed_order = self.client.create_order(order_args)
             result = self.client.post_order(signed_order, order_type=OrderType.FAK)
 
+
             order_id = result.get("orderID", result.get("id", "unknown"))
             status = result.get("status", "unknown")
+
+            # ── Track actual fill amounts from FAK orders ──
+            filled_amount = float(result.get("filled_size", result.get("matchedAmount", 0)))
+            intended_amount = size_usd
+            fill_ratio = filled_amount / intended_amount if intended_amount > 0 else 0
+            slippage = abs(rounded_price - price) if filled_amount > 0 else 0
+
+            logger.info("Fill ratio: %.1f%% (filled $%.2f of $%.2f)",
+                        fill_ratio * 100, filled_amount, intended_amount)
 
             append_jsonl(TRADE_LOG, {
                 "timestamp": time.time(),
@@ -174,6 +235,9 @@ class PolymarketTrader:
                 "size_usd": size_usd,
                 "price": rounded_price,
                 "market_slug": market_slug,
+                "filled_size": filled_amount,
+                "intended_size": intended_amount,
+                "fill_ratio": fill_ratio,
                 "raw_result": str(result)[:500],
             })
 
@@ -182,7 +246,10 @@ class PolymarketTrader:
                 "success": status not in ("error", "failed"),
                 "order_id": order_id,
                 "status": status,
-                "filled_size": size_usd,
+                "filled_size": filled_amount,
+                "intended_size": intended_amount,
+                "fill_ratio": fill_ratio,
+                "slippage": slippage,
                 "avg_price": rounded_price,
             }
 

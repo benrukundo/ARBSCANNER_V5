@@ -388,6 +388,61 @@ class PerformanceTracker:
             f.write(json.dumps(data) + "\n")
 
 
+
+# ═══════════════════════════════════════════════════════════════
+#  ROLLING VOLATILITY CALCULATOR
+# ═══════════════════════════════════════════════════════════════
+
+class RollingVolatility:
+    """Calculates rolling 1-second price volatility from Binance trade feed."""
+
+    def __init__(self, window_seconds: int = 300):
+        self.window = window_seconds
+        self._prices: dict[str, list[tuple[float, float]]] = {}  # crypto_key -> [(timestamp, price), ...]
+        self._vol_cache: dict[str, float] = {}  # crypto_key -> current vol
+
+    def add_price(self, crypto_key: str, price: float, timestamp: float):
+        """Called on every Binance trade tick."""
+        if crypto_key not in self._prices:
+            self._prices[crypto_key] = []
+        buf = self._prices[crypto_key]
+        buf.append((timestamp, price))
+        # Trim to window
+        cutoff = timestamp - self.window
+        while buf and buf[0][0] < cutoff:
+            buf.pop(0)
+        # Recalculate vol if enough data (at least 30 samples)
+        if len(buf) >= 30:
+            self._recalculate(crypto_key)
+
+    def _recalculate(self, crypto_key: str):
+        """Calculate standard deviation of 1-second returns."""
+        import math
+        buf = self._prices[crypto_key]
+        # Bucket into 1-second intervals, take last price per second
+        second_prices = {}
+        for ts, price in buf:
+            sec = int(ts)
+            second_prices[sec] = price
+        sorted_secs = sorted(second_prices.keys())
+        if len(sorted_secs) < 10:
+            return
+        returns = []
+        for i in range(1, len(sorted_secs)):
+            if sorted_secs[i] - sorted_secs[i-1] == 1:  # consecutive seconds only
+                ret = second_prices[sorted_secs[i]] - second_prices[sorted_secs[i-1]]
+                returns.append(ret)
+        if len(returns) >= 10:
+            mean = sum(returns) / len(returns)
+            variance = sum((r - mean) ** 2 for r in returns) / len(returns)
+            vol = math.sqrt(variance)
+            self._vol_cache[crypto_key] = max(vol, 0.0001)  # floor to prevent division by zero
+
+    def get_vol(self, crypto_key: str, fallback: float = 2.5) -> float:
+        """Get current rolling volatility. Falls back to config default if insufficient data."""
+        return self._vol_cache.get(crypto_key, fallback)
+
+
 # ═══════════════════════════════════════════════════════════════
 #  FREQUENCY-OPTIMIZED PAPER TRADER
 # ═══════════════════════════════════════════════════════════════
@@ -413,6 +468,13 @@ class FrequencyOptimizedTrader:
 
         # Live positions (for shadow/live mode)
         self._live_positions: dict = {}  # slug -> live position info
+
+        # Fix 2: Per-market locks to prevent double-entry race conditions
+        self._market_locks: dict[str, asyncio.Lock] = {}
+
+        # Fix 3: Rolling volatility calculator
+        self.rolling_vol = RollingVolatility(window_seconds=300)
+
 
         # Sub-systems
         self.discovery = PredictiveDiscovery()
@@ -474,6 +536,8 @@ class FrequencyOptimizedTrader:
     def _on_binance_price(self, crypto_key: str, price: float, ts_ms: int):
         """Called by BinanceMultiFeed on each price tick."""
         self._crypto_prices[crypto_key] = price
+        # Feed rolling volatility calculator
+        self.rolling_vol.add_price(crypto_key, price, time.time())
         if crypto_key == "btc":
             self._btc_price = price           # backward compat
             self._last_btc_update = time.time()
@@ -481,6 +545,12 @@ class FrequencyOptimizedTrader:
     def _get_crypto_price(self, crypto_key: str) -> float:
         """Get current price for a crypto asset."""
         return self._crypto_prices.get(crypto_key, 0.0)
+
+    def _get_market_lock(self, slug: str) -> asyncio.Lock:
+        """Get or create per-market lock to prevent double-entry race condition."""
+        if slug not in self._market_locks:
+            self._market_locks[slug] = asyncio.Lock()
+        return self._market_locks[slug]
 
     # ── Data Fetchers ─────────────────────────────────────────
 
@@ -662,6 +732,7 @@ class FrequencyOptimizedTrader:
             asyncio.create_task(self.binance_feed.connect(), name="binance-multi-feed"),
             asyncio.create_task(self.clob_ws.run(), name="clob-ws"),
             asyncio.create_task(self._status_loop(), name="status"),
+            asyncio.create_task(self._daily_reset_loop(), name="daily-reset"),
         ]
 
         try:
@@ -864,6 +935,17 @@ class FrequencyOptimizedTrader:
         self, client: httpx.AsyncClient, slug: str, info: dict, source: str
     ):
         """Evaluate strategy for one market and potentially enter."""
+        async with self._get_market_lock(slug):
+            await self._evaluate_market_inner(client, slug, info, source)
+
+    async def _evaluate_market_inner(
+        self, client: httpx.AsyncClient, slug: str, info: dict, source: str
+    ):
+        """Inner evaluation logic (called under per-market lock)."""
+        # Double-entry guard: skip if already positioned
+        if info["position"] is not None:
+            return
+
         now = int(time.time())
         remaining = info["end_ts"] - now
 
@@ -898,7 +980,10 @@ class FrequencyOptimizedTrader:
         crypto_params = {
             **self.params,
             "MIN_DISTANCE": cfg.get("min_distance", self.params.get("MIN_BTC_DISTANCE", 50.0)),
-            "VOLATILITY_1SEC": cfg.get("volatility_1sec", self.params.get("BTC_1SEC_VOLATILITY", 2.5)),
+            "VOLATILITY_1SEC": self.rolling_vol.get_vol(
+                crypto_key,
+                fallback=cfg.get("volatility_1sec", self.params.get("BTC_1SEC_VOLATILITY", 2.5))
+            ),
             "POSITION_SIZE": cfg.get("position_size", self.params.get("POSITION_SIZE", 0.05)),
         }
 
@@ -930,12 +1015,24 @@ class FrequencyOptimizedTrader:
 
             # Execute paper trade
             distance = abs(asset_price - info["price_to_beat"])
-            bet_amount = self.bankroll * crypto_params["POSITION_SIZE"]
-            shares = bet_amount / share_price
+            bet_amount = min(self.bankroll * crypto_params["POSITION_SIZE"], MAX_TRADE_SIZE)
+
+            # Apply simulated slippage for paper mode (makes paper P&L more realistic)
+            if self.mode == "paper":
+                from config import PAPER_SLIPPAGE_BPS
+                slippage_multiplier = 1 + (PAPER_SLIPPAGE_BPS / 10000)
+                simulated_price = share_price * slippage_multiplier
+                # Don't let slippage push price above 0.99
+                simulated_price = min(simulated_price, 0.99)
+            else:
+                simulated_price = share_price
+
+            shares = bet_amount / simulated_price  # use simulated_price in paper mode
 
             info["position"] = {
                 "side": side,
-                "entry_price": share_price,
+                "entry_price": simulated_price,
+                "raw_market_price": share_price,  # actual market price before slippage
                 "estimated_prob": est_prob,
                 "bet_amount": bet_amount,
                 "shares": shares,
@@ -1043,6 +1140,18 @@ class FrequencyOptimizedTrader:
                 price=share_price,
                 market_slug=slug,
             )
+
+            # Check fill ratio
+            fill_ratio = result.get("fill_ratio", 1.0)
+            if fill_ratio < 0.5:
+                logger.warning("[%s] Low fill ratio %.1f%% — order book may be thin",
+                               cfg["name"], fill_ratio * 100)
+
+            # Only proceed if something actually filled
+            actual_filled = result.get("filled_size", trade_size)
+            if actual_filled <= 0:
+                logger.warning("[%s] Zero fill — no position recorded", cfg["name"])
+                return
         except Exception as e:
             logger.error("[%s] Order execution failed: %s", cfg["name"], e)
             append_jsonl(TRADE_LOG, {
@@ -1056,6 +1165,7 @@ class FrequencyOptimizedTrader:
             return
 
         # Record live position
+        actual_trade_size = result.get("filled_size", trade_size) if result.get("fill_ratio", 1) > 0 else trade_size
         self._live_positions[slug] = {
             "crypto_key": crypto_key,
             "crypto_name": cfg["name"],
@@ -1063,7 +1173,7 @@ class FrequencyOptimizedTrader:
             "side": side,
             "entry_price": share_price,
             "estimated_prob": est_prob,
-            "trade_size_usd": trade_size,
+            "trade_size_usd": actual_trade_size,
             "token_id": token_id,
             "order_result": result,
             "mode": self.mode,
@@ -1072,7 +1182,9 @@ class FrequencyOptimizedTrader:
             "entry_time": int(time.time()),
         }
 
-        await self.safety.record_trade(self._live_positions[slug])
+        # Only call safety.record_trade() if something actually filled
+        if result.get("fill_ratio", 1) > 0:
+            await self.safety.record_trade(self._live_positions[slug])
         self._save_v21_state()
 
         logger.info(
@@ -1161,6 +1273,10 @@ class FrequencyOptimizedTrader:
         info["settled"] = True
         info["settled_at"] = now
         self.settled_slugs.add(slug)
+
+        # Clean up per-market lock to prevent memory leak
+        if slug in self._market_locks:
+            del self._market_locks[slug]
 
         # Log performance data for this window
         perf_data = {
@@ -1251,6 +1367,22 @@ class FrequencyOptimizedTrader:
             self._save_v21_state()
 
     # ── Status Loop ───────────────────────────────────────────
+
+    async def _daily_reset_loop(self):
+        """Reset safety manager daily at midnight UTC."""
+        while self.is_running:
+            now = datetime.now(timezone.utc)
+            # Calculate seconds until next midnight UTC
+            tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            if tomorrow <= now:
+                from datetime import timedelta
+                tomorrow += timedelta(days=1)
+            seconds_until_reset = (tomorrow - now).total_seconds()
+            logger.info("Daily reset scheduled in %.0f seconds (midnight UTC)", seconds_until_reset)
+            await asyncio.sleep(seconds_until_reset)
+            if self.is_running:
+                await self.safety.daily_reset()
+                logger.info("Daily safety reset completed")
 
     async def _status_loop(self):
         """Periodic status logging."""

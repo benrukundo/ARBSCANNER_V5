@@ -52,6 +52,9 @@ def is_btc_updown_slug(slug: str) -> bool:
 # MULTI-CRYPTO CONFIGURATION
 # ═════════════════════════════════════════════════════════════
 
+# TODO: Consider making min_distance dynamic (e.g., 0.07% of current price)
+# rather than hardcoded. This would auto-adapt to price changes over time.
+# NOTE: volatility_1sec values are fallbacks only. Live trading uses RollingVolatility from Binance feed.
 CRYPTO_CONFIGS = {
     "btc": {
         "name": "Bitcoin",
@@ -101,7 +104,7 @@ CRYPTO_CONFIGS = {
         "chainlink_ws_symbol": "xrp/usd",
         "timeframes": ["5m", "15m"],
         "volatility_1sec": 0.00015,
-        "min_distance": 0.003,
+        "min_distance": 0.005,          # increased from 0.003 to reduce false entries
         "position_size": 0.05,
         "min_ptb": 0.01,
     },
@@ -114,7 +117,7 @@ CRYPTO_CONFIGS = {
         "chainlink_ws_symbol": "doge/usd",
         "timeframes": ["5m", "15m"],
         "volatility_1sec": 0.000015,
-        "min_distance": 0.0003,
+        "min_distance": 0.0005,         # increased from 0.0003 to reduce false entries
         "position_size": 0.05,
         "min_ptb": 0.001,
     },
@@ -150,7 +153,7 @@ PREDICTIVE_CHECK_INTERVAL = 1   # check for upcoming boundaries every N seconds
 # ── WebSocket Settings ────────────────────────────────────────
 WS_RECONNECT_DELAY = 2
 WS_PING_INTERVAL = 10
-WS_FALLBACK_POLL_INTERVAL = 2   # REST poll if WS disconnects
+WS_FALLBACK_POLL_INTERVAL = 1   # was 2, reduced for faster fallback on 5-min markets
 
 # ── Strategy Defaults (wider 300s entry window) ──────────────
 DEFAULT_STRATEGY_PARAMS = {
@@ -180,6 +183,9 @@ MIN_ENTRY_PRICE = 0.05     # reject phantom quotes below this
 # ── Fees ──────────────────────────────────────────────────────
 POLY_CRYPTO_FEE_RATE = 0.072
 
+# Simulated slippage for paper trading realism (0.5%)
+PAPER_SLIPPAGE_BPS = 50
+
 # ── Paths ─────────────────────────────────────────────────────
 DATA_DIR = "data"
 LOGS_DIR = "logs"
@@ -192,7 +198,10 @@ PERFORMANCE_LOG_FILE = "logs/v21_performance.jsonl"
 # ═════════════════════════════════════════════════════════════
 TRADING_MODE = "paper"          # "paper", "shadow", "live"
 SHADOW_TRADE_SIZE = 1.0         # $ per trade in shadow mode
-MAX_TRADE_SIZE = 5.0            # hard cap on any single trade
+# Position sizing: 5% of bankroll, capped at $100 max per trade
+# This means the bot scales naturally up to $2,000 bankroll before the cap kicks in
+# $100 stays within single-level liquidity and won't dominate market volume
+MAX_TRADE_SIZE = 100.0           # hard cap on any single trade
 MIN_BALANCE_TO_TRADE = 10.0     # minimum wallet balance to trade
 
 # ── Safety Limits ─────────────────────────────────────────────
