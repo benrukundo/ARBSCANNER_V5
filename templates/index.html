@@ -143,6 +143,7 @@
                 </label>
                 <button onclick="applyTradeFilter()" style="background:#2196f3;color:#fff;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:13px;">Filter</button>
                 <button onclick="clearTradeFilter()" style="background:#555;color:#fff;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:13px;">Clear</button>
+                <button onclick="exportTradesCSV()" style="background:#ff9800;color:#fff;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:13px;">&#x1F4E5; Export CSV</button>
             </div>
             <table>
                 <thead>
@@ -534,6 +535,68 @@
         _pageSize = parseInt(document.getElementById('page-size').value);
         _currentPage = 1;
         renderPage();
+    }
+
+    function exportTradesCSV() {
+        const trades = _filteredTrades || [];
+        if (!trades.length) { alert('No trades to export'); return; }
+
+        const headers = ['#','Mode','Timestamp','Crypto','Market','Timeframe','Side',
+            'Entry Price','Est. Prob','Outcome','Result','Bet Amount','Net Profit',
+            'Bankroll After','Time Remaining','Entry Source','BTC Price','BTC Distance'];
+
+        const escCSV = (v) => {
+            const s = String(v == null ? '' : v);
+            return s.includes(',') || s.includes('"') || s.includes('\n')
+                ? '"' + s.replace(/"/g, '""') + '"' : s;
+        };
+
+        let csv = headers.join(',') + '\n';
+        trades.forEach((t, i) => {
+            const tfMatch = t.market_slug ? t.market_slug.match(/-updown-(\w+)-/) : null;
+            const tf = tfMatch ? tfMatch[1] : '5m';
+            const mode = (t.mode || 'paper').toUpperCase();
+            const ts = t.timestamp ? new Date(t.timestamp * 1000).toISOString().replace('T',' ').slice(0,19) : '';
+            const crypto = t.crypto_name || 'Bitcoin';
+            const row = [
+                i + 1,
+                mode,
+                ts,
+                crypto,
+                escCSV(t.market_slug || ''),
+                tf,
+                t.side || '',
+                (t.entry_price || 0).toFixed(4),
+                (t.estimated_prob || 0).toFixed(4),
+                t.actual_outcome || '',
+                t.won ? 'WIN' : 'LOSS',
+                (t.bet_amount || 0).toFixed(2),
+                (t.net_profit || 0).toFixed(4),
+                (t.bankroll_after || 0).toFixed(2),
+                (t.time_remaining || 0) + 's',
+                escCSV(t.entry_source || ''),
+                t.btc_price || '',
+                t.btc_distance_pct ? t.btc_distance_pct.toFixed(4) : ''
+            ];
+            csv += row.join(',') + '\n';
+        });
+
+        // Add summary row
+        const totalPnl = trades.reduce((s, t) => s + (t.net_profit || 0), 0);
+        const wins = trades.filter(t => t.won).length;
+        csv += '\n';
+        csv += 'Summary,' + trades.length + ' trades,' + wins + ' wins,' + (trades.length - wins) + ' losses,';
+        csv += 'Win Rate: ' + (trades.length ? (wins/trades.length*100).toFixed(1) : 0) + '%,';
+        csv += ',,,,,,Total P&L:,' + totalPnl.toFixed(4) + '\n';
+
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        const now = new Date().toISOString().slice(0,10);
+        a.href = url;
+        a.download = 'trade_history_' + now + '.csv';
+        a.click();
+        URL.revokeObjectURL(url);
     }
 
     // ── Performance Page ──
