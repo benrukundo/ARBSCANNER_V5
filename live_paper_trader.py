@@ -361,11 +361,27 @@ class CLOBWebSocket:
                 # Best ask = lowest sell price = what we'd pay to buy
                 if asks:
                     try:
-                        best_ask = min(float(a.get("price", 999)) for a in asks if float(a.get("size", 0)) > 0)
-                        self.prices[asset_id] = best_ask
-                        self.last_update[asset_id] = time.time()
-                        if self._on_price_update:
-                            self._on_price_update(asset_id, best_ask)
+                        # Filter to rows with both valid price and positive size.
+                        # Previously used .get("price", 999) which could inject a
+                        # phantom $999 ask if price was missing.
+                        valid_asks = []
+                        for a in asks:
+                            p_raw = a.get("price")
+                            s_raw = a.get("size")
+                            if p_raw is None or s_raw is None:
+                                continue
+                            try:
+                                s = float(s_raw)
+                                if s > 0:
+                                    valid_asks.append(float(p_raw))
+                            except (ValueError, TypeError):
+                                continue
+                        if valid_asks:
+                            best_ask = min(valid_asks)
+                            self.prices[asset_id] = best_ask
+                            self.last_update[asset_id] = time.time()
+                            if self._on_price_update:
+                                self._on_price_update(asset_id, best_ask)
                     except (ValueError, TypeError):
                         pass
 
@@ -608,6 +624,51 @@ class FrequencyOptimizedTrader:
             logger.debug(f"BTC price error: {e}")
             return self._btc_price
 
+    async def _get_historical_price(
+        self, client: httpx.AsyncClient, crypto_key: str, target_ts: int
+    ) -> float | None:
+        """Fetch the Binance trade price at or nearest to target_ts (unix seconds).
+
+        Used for settlement-time outcome inference when Polymarket resolution is
+        delayed. Previously we fell back to the CURRENT price, which for 5m
+        markets could drift meaningfully from the actual close price and produce
+        paper P&L that disagrees with real resolution.
+
+        Returns None on failure; caller falls back to live price as last resort.
+        """
+        cfg = CRYPTO_CONFIGS.get(crypto_key)
+        if not cfg:
+            return None
+        symbol = cfg.get("binance_symbol")
+        if not symbol:
+            return None
+        start_ms = target_ts * 1000
+        end_ms = start_ms + 60_000   # 1-minute window starting at target
+        try:
+            resp = await client.get(
+                "https://api.binance.com/api/v3/klines",
+                params={
+                    "symbol": symbol,
+                    "interval": "1m",
+                    "startTime": start_ms,
+                    "endTime": end_ms,
+                    "limit": 1,
+                },
+                timeout=5,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                return None
+            # Kline format: [open_ts, open, high, low, close, volume, close_ts, ...]
+            # Use the OPEN of the minute containing target_ts as the best
+            # approximation of the close price at market resolution.
+            kline = data[0]
+            return float(kline[1])
+        except Exception as e:
+            logger.debug(f"Historical price fetch failed for {crypto_key}@{target_ts}: {e}")
+            return None
+
     async def _get_share_prices_rest(
         self, client: httpx.AsyncClient, up_token: str, down_token: str
     ) -> tuple[float, float]:
@@ -671,11 +732,11 @@ class FrequencyOptimizedTrader:
         except Exception:
             pass
 
-        # 3) Fallback: use current crypto price (if available)
-        price = self._get_crypto_price(crypto_key)
-        if price > min_ptb:
-            return price
-        return 0  # Caller must handle 0 = unknown
+        # 3) Both sources failed — return 0 to signal "unknown strike".
+        # Previously fell back to current crypto price, which produced
+        # distance=0 and caused surprising near-zero-distance behaviour
+        # instead of a clean skip. Caller must handle 0 = unknown.
+        return 0
 
     async def _check_resolution(self, client: httpx.AsyncClient, slug: str) -> str | None:
         try:
@@ -781,9 +842,9 @@ class FrequencyOptimizedTrader:
                 count = result.get("redeemed", 0)
                 if count > 0:
                     logger.info("Auto-redeemed %d positions", count)
-                    # Force balance refresh
+                    # Force balance refresh — _balance_cache is a (balance, timestamp) tuple
                     if hasattr(self, "trader") and self.trader:
-                        self.trader._balance_cache_time = 0
+                        self.trader._balance_cache = (0.0, 0)
             except Exception as e:
                 logger.error("Redeem loop error: %s", e)
 
@@ -798,6 +859,17 @@ class FrequencyOptimizedTrader:
         logger.info(f"  Bankroll: ${self.bankroll:.2f}")
         logger.info(f"  Strategy: {self.params}")
         logger.info(f"  Staged entry: {STAGED_ENTRY}")
+
+        # Reconcile safety state with actual live positions.
+        # _load_state resets current_positions to 0 on restart; if we crashed
+        # with open positions, safety counter must match reality to avoid
+        # exceeding MAX_CONCURRENT_POSITIONS.
+        if self.mode != "paper" and self.trader and self.trader.is_ready:
+            try:
+                open_orders = await self.trader.get_open_orders()
+                await self.safety.reconcile_positions(len(open_orders))
+            except Exception as e:
+                logger.warning("Safety reconciliation failed: %s", e)
 
         # Start Binance multi-crypto feed
         self.binance_feed = BinanceMultiFeed(
@@ -1255,6 +1327,12 @@ class FrequencyOptimizedTrader:
         if self.mode == "paper":
             return
 
+        # Re-entry guard: prevent duplicate live positions if called twice for same slug
+        if slug in self._live_positions:
+            logger.warning("[%s] _execute_real_trade called but live position already exists, skipping",
+                           slug)
+            return
+
         cfg = CRYPTO_CONFIGS.get(crypto_key, CRYPTO_CONFIGS["btc"])
 
         # Safety check
@@ -1273,6 +1351,7 @@ class FrequencyOptimizedTrader:
             return
 
         # Determine trade size (respects liquidity cap from paper evaluation)
+        balance = 0.0
         if self.mode == "shadow":
             trade_size = SHADOW_TRADE_SIZE
         elif self.mode == "live":
@@ -1285,7 +1364,7 @@ class FrequencyOptimizedTrader:
 
         if trade_size < 1.0 or (self.mode == "live" and trade_size > balance):
             logger.info("[%s] Trade size $%.2f not viable (balance=$%.2f), skipping",
-                        cfg["name"], trade_size, await self.trader.get_balance() if self.mode == "live" else 0)
+                        cfg["name"], trade_size, balance if self.mode == "live" else 0)
             return
 
         # Token ID
@@ -1453,8 +1532,23 @@ class FrequencyOptimizedTrader:
         if outcome is None:
             if expired_for < 35:
                 return  # Retry next cycle
-            outcome = "Up" if asset_price >= info["price_to_beat"] else "Down"
-            logger.info(f"  [{cfg['name']}] {slug} → inferred {outcome}")
+            # Prefer historical price AT market close over current live price.
+            # For 5m markets especially, 35+ seconds of drift between end_ts and
+            # "now" can flip the inferred outcome vs what Polymarket will
+            # eventually resolve to. Fall back to live price only if hist fetch
+            # fails entirely.
+            close_price = await self._get_historical_price(client, crypto_key, info["end_ts"])
+            if close_price is None:
+                close_price = asset_price
+                logger.warning(
+                    f"  [{cfg['name']}] {slug} → historical fetch failed, "
+                    f"using live price ${close_price:,.6g} for inference"
+                )
+            outcome = "Up" if close_price >= info["price_to_beat"] else "Down"
+            logger.info(
+                f"  [{cfg['name']}] {slug} → inferred {outcome} "
+                f"(close=${close_price:,.6g} vs strike=${info['price_to_beat']:,.6g})"
+            )
         else:
             logger.info(f"  {slug} → resolved {outcome}")
 
@@ -1504,10 +1598,18 @@ class FrequencyOptimizedTrader:
         if live_pos and self.mode != "paper":
             # Use ACTUAL CLOB amounts (not paper-sized)
             real_bet = live_pos.get("trade_size_usd", 0)
-            # Get real shares from order result's takingAmount
-            raw = str(live_pos.get("order_result", {}).get("raw_result", ""))
-            taking_match = re.search(r"'takingAmount':\s*'([\d.]+)'", raw)
-            real_shares = float(taking_match.group(1)) if taking_match else (real_bet / pos["entry_price"] if pos["entry_price"] > 0 else 0)
+            order_result = live_pos.get("order_result", {})
+            # Prefer clean taking_amount from order_result (structured).
+            # Fall back to legacy regex on raw_result for positions opened
+            # before the schema change, then to bet/entry_price ratio.
+            real_shares = float(order_result.get("taking_amount", 0) or 0)
+            if real_shares <= 0:
+                raw = str(order_result.get("raw_result", ""))
+                taking_match = re.search(r"'takingAmount':\s*'([\d.]+)'", raw)
+                real_shares = (
+                    float(taking_match.group(1)) if taking_match
+                    else (real_bet / pos["entry_price"] if pos["entry_price"] > 0 else 0)
+                )
             real_payout = real_shares * 1.0 if won else 0.0
             # For CLOB trades, fee is already embedded in the fill price
             real_net = real_payout - real_bet
@@ -1515,6 +1617,7 @@ class FrequencyOptimizedTrader:
             logger.info(f"  [{cfg['name']}] CLOB P&L: bet=${real_bet:.4f} shares={real_shares:.4f} payout=${real_payout:.4f} net=${real_net:+.4f} {'WIN' if won else 'LOSS'}")
         else:
             net_profit_real = None  # paper trade, no real amounts
+            real_shares = 0.0
 
         payout = calculate_payout(pos["shares"], won)
         fee = calculate_fee(pos["bet_amount"], pos["entry_price"], POLY_CRYPTO_FEE_RATE)
@@ -1585,7 +1688,7 @@ class FrequencyOptimizedTrader:
                 "outcome": outcome,
                 "won": won,
                 "bet_amount": live_pos.get("trade_size_usd", 0),
-                "payout": (float(taking_match.group(1)) if taking_match else 0) if won else 0,
+                "payout": (real_shares if won else 0.0),
                 "net_profit": round(actual_pnl, 6),
                 "real_pnl_total": round(self.real_pnl_total, 6),
                 "order_id": live_pos.get("order_result", {}).get("order_id", ""),

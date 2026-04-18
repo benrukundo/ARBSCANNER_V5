@@ -186,6 +186,30 @@ PAPER_CHECK_INTERVAL = 2   # faster fallback polling than V1's 5s
 # ── Safety ────────────────────────────────────────────────────
 MIN_ENTRY_PRICE = 0.80     # minimum entry price — rejects any bet below $0.80
 
+# ── Trade Execution Constants (shared across strategy.py & trading_client.py) ──
+# Previously duplicated inline in trading_client.place_order. Note the TWO
+# different edge thresholds — they serve different purposes:
+#
+#   MIN_EDGE               = strategy entry gate (opportunity filter). Only
+#                            evaluate markets where est_prob - raw_ask exceeds
+#                            this. Set high to be selective about what's worth
+#                            playing.
+#   MIN_EDGE_POST_BUFFER   = execution-layer safety net. After the $PRICE_BUFFER
+#                            is added to the ask for reliable FAK fills, confirm
+#                            the buffer didn't eat ALL the edge. This is a
+#                            degradation circuit-breaker, not a quality filter —
+#                            the quality decision already happened upstream.
+#
+# Invariant to keep in mind: MIN_EDGE_POST_BUFFER + PRICE_BUFFER should be
+# comfortably ≤ MIN_EDGE, otherwise the post-buffer check becomes unreachable.
+# With defaults (MIN_EDGE=0.06, PRICE_BUFFER=0.02, MIN_EDGE_POST_BUFFER=0.03),
+# any strategy-approved trade has post-buffer edge ≥ 0.04, so the 0.03
+# safety net only fires on unfavourable rounding or unusually large buffers.
+MAX_ENTRY_PRICE = 0.95       # hard cap on buffered order price
+MAX_ENTRY_PRICE_ABS = 0.99   # absolute ceiling — reject orders above this
+MIN_EDGE = 0.06              # strategy entry gate — high-edge opportunities only
+MIN_EDGE_POST_BUFFER = 0.03  # post-buffer safety net — buffer didn't eat all edge
+
 # ── Fees ──────────────────────────────────────────────────────
 POLY_CRYPTO_FEE_RATE = 0.072
 

@@ -10,6 +10,7 @@ from config import (
     API_KEY, API_SECRET, API_PASSPHRASE,
     TRADE_LOG, ERROR_LOG, DATA_DIR,
     PRICE_BUFFER, MIN_ENTRY_PRICE,
+    MAX_ENTRY_PRICE, MAX_ENTRY_PRICE_ABS, MIN_EDGE_POST_BUFFER,
 )
 
 logger = logging.getLogger("v21.trading_client")
@@ -185,14 +186,14 @@ class PolymarketTrader:
                 "slippage": 0,
             }
 
-        # Query current fee rate from CLOB API
+        # Query current fee rate from CLOB API (non-blocking)
         try:
             import httpx
-            fee_resp = httpx.get(
-                f"https://clob.polymarket.com/fee-rate?token_id={token_id}",
-                timeout=5,
-            )
-            fee_data = fee_resp.json()
+            async with httpx.AsyncClient(timeout=5) as _client:
+                fee_resp = await _client.get(
+                    f"https://clob.polymarket.com/fee-rate?token_id={token_id}",
+                )
+                fee_data = fee_resp.json()
             logger.info("Fee rate for %s: %s", token_id[:16], fee_data)
         except Exception as fe:
             logger.warning("Fee rate query failed: %s — proceeding with order", fe)
@@ -212,9 +213,13 @@ class PolymarketTrader:
             amount = round(size_usd, 2)
 
             # ── Apply PRICE_BUFFER for reliable FAK fills ──
-            MAX_ENTRY_PRICE = 0.95
-            MAX_ENTRY_PRICE_ABS = 0.99
-            MIN_EDGE = 0.03
+            # MAX_ENTRY_PRICE, MAX_ENTRY_PRICE_ABS, MIN_EDGE_POST_BUFFER imported
+            # from config. NOTE: the post-buffer edge check below uses
+            # MIN_EDGE_POST_BUFFER (a lenient safety net, not MIN_EDGE). The
+            # strategy entry gate in strategy.py already enforced MIN_EDGE on
+            # the raw ask; here we only verify the buffer didn't eat ALL the
+            # edge. Applying MIN_EDGE again here would charge the buffer cost
+            # twice against the edge budget and reject profitable trades.
 
             market_ask = round(price, 2)
             buffered_price = round(min(market_ask + PRICE_BUFFER, MAX_ENTRY_PRICE), 2)
@@ -236,14 +241,19 @@ class PolymarketTrader:
                     "filled_size": 0, "intended_size": size_usd, "fill_ratio": 0, "slippage": 0,
                 }
 
-            # Recalculate edge after buffer
+            # Recalculate edge after buffer — circuit-breaker, not quality filter.
+            # See comment above re: why this uses MIN_EDGE_POST_BUFFER not MIN_EDGE.
             if estimated_prob is not None:
                 edge_after_buffer = estimated_prob - buffered_price
-                logger.info("Edge after buffer: est_prob=%.4f - buffered=%.4f = edge=%.4f (min=%.2f)",
-                            estimated_prob, buffered_price, edge_after_buffer, MIN_EDGE)
-                if edge_after_buffer < MIN_EDGE:
-                    logger.info("SKIPPED: edge_after_buffer=%.4f < MIN_EDGE=%.2f — buffer eats the edge",
-                                edge_after_buffer, MIN_EDGE)
+                logger.info(
+                    "Edge after buffer: est_prob=%.4f - buffered=%.4f = edge=%.4f (min_post_buffer=%.2f)",
+                    estimated_prob, buffered_price, edge_after_buffer, MIN_EDGE_POST_BUFFER,
+                )
+                if edge_after_buffer < MIN_EDGE_POST_BUFFER:
+                    logger.info(
+                        "SKIPPED: edge_after_buffer=%.4f < MIN_EDGE_POST_BUFFER=%.2f — buffer eats the edge",
+                        edge_after_buffer, MIN_EDGE_POST_BUFFER,
+                    )
                     return {
                         "success": False, "order_id": None, "status": "edge_too_thin_after_buffer",
                         "filled_size": 0, "intended_size": size_usd, "fill_ratio": 0, "slippage": 0,
@@ -316,6 +326,12 @@ class PolymarketTrader:
             })
 
             logger.info("Order result: id=%s status=%s", order_id, status)
+            # Pull takingAmount (shares filled) structurally — avoids the
+            # fragile regex parse on truncated str(result) in settlement.
+            try:
+                taking_amount = float(result.get("takingAmount", 0) or 0)
+            except (ValueError, TypeError):
+                taking_amount = 0.0
             return {
                 "success": status not in ("error", "failed"),
                 "order_id": order_id,
@@ -325,6 +341,7 @@ class PolymarketTrader:
                 "fill_ratio": fill_ratio,
                 "slippage": 0,
                 "avg_price": price,
+                "taking_amount": taking_amount,
             }
 
         except Exception as e:

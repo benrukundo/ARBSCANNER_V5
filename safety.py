@@ -98,6 +98,18 @@ class SafetyManager:
 
     # ── Core Safety Check ─────────────────────────────────────
 
+    async def reconcile_positions(self, live_positions_count: int):
+        """Reconcile current_positions count from trader's live positions.
+
+        Called on trader startup — _load_state resets current_positions to 0
+        because persisted value is stale. But if bot crashes and restarts with
+        open positions on Polymarket, the safety counter should match the
+        ACTUAL open position count, not 0.
+        """
+        self.current_positions = max(0, int(live_positions_count))
+        self._save_state()
+        logger.info("Safety reconciled: current_positions=%d", self.current_positions)
+
     async def can_trade(self) -> bool:
         """Master safety check — ALL must pass."""
         if self.is_kill_switch_active():
