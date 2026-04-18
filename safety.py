@@ -48,7 +48,8 @@ class SafetyManager:
                 self.daily_pnl = state.get("daily_pnl", 0.0)
                 self.daily_trades = state.get("daily_trades", 0)
                 self.consecutive_losses = state.get("consecutive_losses", 0)
-                self.current_positions = state.get("current_positions", 0)
+                self.current_positions = 0  # Always reset on startup — _live_positions is empty after restart
+                # (persisted value is stale; positions don't survive restarts)
                 self.is_halted = state.get("is_halted", False)
                 self.halt_reason = state.get("halt_reason", "")
                 logger.info(

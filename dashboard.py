@@ -11,11 +11,14 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from redeem import get_redeem_status, run_redeem_cycle
 from config import (
     DASHBOARD_PORT, PAPER_INITIAL_BANKROLL, VERSION,
     PERFORMANCE_LOG_FILE, PAPER_TRADES_FILE,
     ACTIVE_CRYPTOS, CRYPTO_CONFIGS, TRADING_MODE,
 )
+
+CLOB_TRADE_LOG = Path("logs/trades.jsonl")
 from safety import SafetyManager
 from live_paper_trader import FrequencyOptimizedTrader
 
@@ -238,6 +241,171 @@ async def get_alerts():
     if _trader:
         return {"alerts": _trader.safety.get_recent_alerts(20)}
     return {"alerts": []}
+
+
+# ── Live CLOB Orders API ───────────────────────────────────
+
+@app.get("/api/live/orders")
+async def live_orders(limit: int = 200):
+    """Return CLOB order history from trades.jsonl."""
+    if not CLOB_TRADE_LOG.exists():
+        return []
+    entries = []
+    settlements = {}  # market_slug -> settlement data
+    with open(CLOB_TRADE_LOG) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                t = entry.get("type", "")
+                if t in ("order_intent", "order_result",
+                         "order_no_fill", "order_error"):
+                    entries.append(entry)
+                elif t == "trade_settled":
+                    settlements[entry.get("market_slug", "")] = entry
+            except json.JSONDecodeError:
+                continue
+    # Merge settlement outcome into order_result entries
+    for e in entries:
+        if e.get("type") == "order_result" and e.get("market_slug"):
+            settle = settlements.get(e["market_slug"])
+            if settle:
+                e["won"] = settle.get("won")
+                e["outcome"] = settle.get("outcome", "")
+                e["real_pnl"] = settle.get("net_profit", 0)
+                e["real_payout"] = settle.get("payout", 0)
+                e["real_bet"] = settle.get("bet_amount", 0)
+    return entries[-limit:]
+
+
+@app.get("/api/live/positions")
+async def live_positions():
+    """Return current live/shadow positions tracked by the trader."""
+    if not _trader:
+        return {"positions": [], "mode": "unknown"}
+    positions = []
+    for slug, pos in _trader._live_positions.items():
+        positions.append({
+            "slug": slug,
+            "crypto": pos.get("crypto_name", "?"),
+            "side": pos.get("side", "?"),
+            "entry_price": pos.get("entry_price", 0),
+            "trade_size": pos.get("trade_size_usd", 0),
+            "mode": pos.get("mode", "?"),
+            "order_id": pos.get("order_result", {}).get("order_id", "?"),
+            "entry_time": pos.get("entry_time", 0),
+            "token_id": pos.get("token_id", "")[:16] + "...",
+        })
+    return {
+        "positions": positions,
+        "mode": _trader.mode,
+        "real_pnl_total": _trader.real_pnl_total,
+        "real_trade_count": _trader.real_trade_count,
+        "wallet_balance": getattr(_trader, '_last_wallet_balance', 0),
+    }
+
+
+@app.get("/api/live/summary")
+async def live_summary():
+    """Summary stats for live CLOB trading."""
+    if not CLOB_TRADE_LOG.exists():
+        return {"total_orders": 0}
+
+    intents = 0
+    fills = 0
+    no_fills = 0
+    errors = 0
+    total_usd_sent = 0.0
+    total_usd_filled = 0.0
+
+    with open(CLOB_TRADE_LOG) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+                t = e.get("type", "")
+                if t == "order_intent":
+                    intents += 1
+                elif t == "order_result":
+                    fills += 1
+                    total_usd_sent += float(e.get("size_usd", 0))
+                    total_usd_filled += float(e.get("filled_size", 0))
+                elif t == "order_no_fill":
+                    no_fills += 1
+                elif t == "order_error":
+                    errors += 1
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+
+    # Count wins/losses from settlement log
+    wins = losses = 0
+    if CLOB_TRADE_LOG.exists():
+        with open(CLOB_TRADE_LOG) as sf:
+            for sline in sf:
+                sline = sline.strip()
+                if not sline:
+                    continue
+                try:
+                    se = json.loads(sline)
+                    if se.get("type") == "trade_settled":
+                        if se.get("won"):
+                            wins += 1
+                        elif se.get("won") is False:
+                            losses += 1
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+    return {
+        "total_orders": intents,
+        "fills": fills,
+        "no_fills": no_fills,
+        "errors": errors,
+        "total_usd_sent": round(total_usd_sent, 2),
+        "total_usd_filled": round(total_usd_filled, 2),
+        "fill_rate_pct": round(fills / intents * 100, 1) if intents > 0 else 0,
+        "mode": _trader.mode if _trader else TRADING_MODE,
+        "real_pnl_total": round(_trader.real_pnl_total, 6) if _trader else 0,
+        "real_trade_count": _trader.real_trade_count if _trader else 0,
+        "wins": wins,
+        "losses": losses,
+    }
+
+
+
+# ── Redeem ────────────────────────────────────────────────────
+
+@app.get("/api/redeem/status")
+async def redeem_status():
+    """Return auto-redeem loop status."""
+    return get_redeem_status()
+
+
+@app.post("/api/redeem/trigger")
+async def redeem_trigger():
+    """Manually trigger a redeem cycle."""
+    import asyncio
+    from config import (
+        PRIVATE_KEY, FUNDER_ADDRESS, SIGNATURE_TYPE,
+        BUILDER_API_KEY, BUILDER_SECRET, BUILDER_PASSPHRASE,
+    )
+    if not BUILDER_API_KEY or not BUILDER_SECRET:
+        return {"status": "error", "error": "Builder API keys not configured"}
+    result = await asyncio.to_thread(
+        run_redeem_cycle,
+        private_key=PRIVATE_KEY,
+        funder_address=FUNDER_ADDRESS,
+        signature_type=SIGNATURE_TYPE,
+        builder_api_key=BUILDER_API_KEY,
+        builder_secret=BUILDER_SECRET,
+        builder_passphrase=BUILDER_PASSPHRASE,
+    )
+    return result
+
 
 
 # ── Health ────────────────────────────────────────────────────

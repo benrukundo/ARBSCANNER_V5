@@ -25,6 +25,8 @@ from pathlib import Path
 
 import httpx
 
+from redeem import run_redeem_cycle, get_redeem_status
+
 try:
     import websockets
 except ImportError:
@@ -36,10 +38,10 @@ from config import (
     DEFAULT_STRATEGY_PARAMS, POLY_CRYPTO_FEE_RATE,
     LOGS_DIR, PAPER_TRADES_FILE, PERFORMANCE_LOG_FILE,
     PREDICTIVE_PREFETCH_SECS, PREDICTIVE_CHECK_INTERVAL,
-    STAGED_ENTRY, MIN_ENTRY_PRICE, VERSION,
+    STAGED_ENTRY, MIN_ENTRY_PRICE, VERSION, PRICE_BUFFER,
     WS_CLOB_URL, WS_RECONNECT_DELAY, WS_FALLBACK_POLL_INTERVAL,
     SLUG_DURATION_MAP,
-    CRYPTO_CONFIGS, ACTIVE_CRYPTOS, TRADING_MODE, SHADOW_TRADE_SIZE, MAX_TRADE_SIZE, TRADE_LOG, STATE_FILE,
+    CRYPTO_CONFIGS, ACTIVE_CRYPTOS, TRADING_MODE, SHADOW_TRADE_SIZE, MAX_TRADE_SIZE, MIN_TRADE_SIZE, TRADE_LOG, STATE_FILE,
     )
 from strategy import should_enter_staged, calculate_fee, calculate_payout
 from trading_client import PolymarketTrader, append_jsonl
@@ -225,7 +227,10 @@ class CLOBWebSocket:
     """Maintains WebSocket connection to Polymarket CLOB for real-time prices."""
 
     def __init__(self, on_price_update=None):
-        self.prices: dict[str, float] = {}          # token_id → best price
+        self.prices: dict[str, float] = {}          # token_id → best ask price
+        self.best_bids: dict[str, float] = {}       # token_id → best bid price
+        self.ask_sizes: dict[str, float] = {}        # token_id → total $ available at asks
+        self.ask_levels: dict[str, list] = {}        # token_id → sorted [(price, size), ...] top 20
         self.last_update: dict[str, float] = {}     # token_id → timestamp
         self._subscribed_tokens: set[str] = set()
         self._pending_tokens: set[str] = set()      # tokens to add
@@ -242,8 +247,28 @@ class CLOBWebSocket:
                 self._pending_tokens.add(tid)
 
     def get_price(self, token_id: str) -> float | None:
-        """Get cached price for a token. None if no data."""
+        """Get cached best ask price for a token. None if no data."""
         return self.prices.get(token_id)
+
+    def get_best_bid(self, token_id: str) -> float | None:
+        """Get cached best bid price for a token. None if no data."""
+        return self.best_bids.get(token_id)
+
+    def get_ask_liquidity(self, token_id: str) -> float:
+        """Get total $ liquidity available on ask side. 0 if unknown."""
+        return self.ask_sizes.get(token_id, 0.0)
+
+    def get_available_liquidity(self, token_id: str, max_price: float) -> tuple:
+        """Returns (total_shares, total_usd) available on ask side at or below max_price.
+        Uses cached ask levels from WS book events."""
+        levels = self.ask_levels.get(token_id, [])
+        total_shares = 0.0
+        total_usd = 0.0
+        for price, size in levels:
+            if price <= max_price:
+                total_shares += size
+                total_usd += price * size
+        return total_shares, total_usd
 
     def price_age_ms(self, token_id: str) -> float:
         """Milliseconds since last price update for this token."""
@@ -344,29 +369,43 @@ class CLOBWebSocket:
                     except (ValueError, TypeError):
                         pass
 
-            elif event_type == "last_trade_price" and asset_id:
-                price = event.get("price")
-                if price is not None:
+                # Calculate total ask-side liquidity ($ available to buy)
+                if asks:
                     try:
-                        p = float(price)
-                        self.prices[asset_id] = p
-                        self.last_update[asset_id] = time.time()
-                        if self._on_price_update:
-                            self._on_price_update(asset_id, p)
+                        total_ask_usd = sum(
+                            float(a.get("price", 0)) * float(a.get("size", 0))
+                            for a in asks if float(a.get("size", 0)) > 0
+                        )
+                        self.ask_sizes[asset_id] = total_ask_usd
+                        # Cache sorted ask levels (top 20) for depth queries
+                        sorted_asks = sorted(
+                            [(float(a.get("price", 0)), float(a.get("size", 0)))
+                             for a in asks if float(a.get("size", 0)) > 0],
+                            key=lambda x: x[0]
+                        )[:20]
+                        self.ask_levels[asset_id] = sorted_asks
                     except (ValueError, TypeError):
                         pass
 
-            elif event_type == "price_change" and asset_id:
-                price = event.get("price")
-                if price is not None:
+                # Best bid = highest buy price (for logging/spread calculation)
+                if bids:
                     try:
-                        p = float(price)
-                        self.prices[asset_id] = p
-                        self.last_update[asset_id] = time.time()
-                        if self._on_price_update:
-                            self._on_price_update(asset_id, p)
+                        best_bid = max(float(b.get("price", 0)) for b in bids if float(b.get("size", 0)) > 0)
+                        self.best_bids[asset_id] = best_bid
                     except (ValueError, TypeError):
                         pass
+
+            elif event_type == "last_trade_price" and asset_id:
+                # Do NOT overwrite best_ask with last trade price.
+                # last_trade_price can be at bid or any filled level,
+                # which would cause FAK buy orders to be placed below
+                # the actual ask, resulting in zero fills.
+                pass
+
+            elif event_type == "price_change" and asset_id:
+                # Do NOT overwrite best_ask with price_change events.
+                # Only book events provide reliable bid/ask separation.
+                pass
 
     def stop(self):
         self._running = False
@@ -572,7 +611,7 @@ class FrequencyOptimizedTrader:
     async def _get_share_prices_rest(
         self, client: httpx.AsyncClient, up_token: str, down_token: str
     ) -> tuple[float, float]:
-        """REST fallback for share prices."""
+        """REST fallback for share prices (uses best ask via side=buy)."""
         up_price, down_price = 0.5, 0.5
         for tid, is_up in [(up_token, True), (down_token, False)]:
             if not tid:
@@ -707,6 +746,49 @@ class FrequencyOptimizedTrader:
 
     # ── Main Run ──────────────────────────────────────────────
 
+
+    async def _redeem_loop(self):
+        """Periodically redeem resolved positions to recycle capital."""
+        from config import (
+            PRIVATE_KEY, FUNDER_ADDRESS, SIGNATURE_TYPE,
+            BUILDER_API_KEY, BUILDER_SECRET, BUILDER_PASSPHRASE,
+        )
+        # Wait 30s on startup before first check
+        await asyncio.sleep(30)
+
+        while self.is_running:
+            # Only run in shadow or live mode
+            if self.mode not in ("shadow", "live"):
+                await asyncio.sleep(120)
+                continue
+
+            # Skip if Builder keys not configured
+            if not BUILDER_API_KEY or not BUILDER_SECRET or not BUILDER_PASSPHRASE:
+                logger.debug("Builder API keys not configured, skipping redeem")
+                await asyncio.sleep(300)
+                continue
+
+            try:
+                result = await asyncio.to_thread(
+                    run_redeem_cycle,
+                    private_key=PRIVATE_KEY,
+                    funder_address=FUNDER_ADDRESS,
+                    signature_type=SIGNATURE_TYPE,
+                    builder_api_key=BUILDER_API_KEY,
+                    builder_secret=BUILDER_SECRET,
+                    builder_passphrase=BUILDER_PASSPHRASE,
+                )
+                count = result.get("redeemed", 0)
+                if count > 0:
+                    logger.info("Auto-redeemed %d positions", count)
+                    # Force balance refresh
+                    if hasattr(self, "trader") and self.trader:
+                        self.trader._balance_cache_time = 0
+            except Exception as e:
+                logger.error("Redeem loop error: %s", e)
+
+            await asyncio.sleep(120)  # Check every 2 minutes
+
     async def run(self):
         self.is_running = True
         self._started_at = time.time()
@@ -733,6 +815,7 @@ class FrequencyOptimizedTrader:
             asyncio.create_task(self.clob_ws.run(), name="clob-ws"),
             asyncio.create_task(self._status_loop(), name="status"),
             asyncio.create_task(self._daily_reset_loop(), name="daily-reset"),
+            asyncio.create_task(self._redeem_loop(), name="auto-redeem"),
         ]
 
         try:
@@ -963,12 +1046,19 @@ class FrequencyOptimizedTrader:
         if info["price_to_beat"] <= min_ptb:
             return
 
-        # Get prices — prefer WS, fallback to REST
+        # Get prices — prefer WS best ask, fallback to REST
         up_ws, down_ws = self._get_share_prices_ws(
             info["up_token_id"], info["down_token_id"]
         )
         if up_ws is not None and down_ws is not None:
             up_price, down_price = up_ws, down_ws
+            # Log order book spread for both sides
+            up_bid = self.clob_ws.get_best_bid(info["up_token_id"])
+            down_bid = self.clob_ws.get_best_bid(info["down_token_id"])
+            if up_bid is not None:
+                logger.debug(f"  [{slug}] Up book: best_bid={up_bid:.4f} best_ask={up_price:.4f} spread={up_price-up_bid:.4f}")
+            if down_bid is not None:
+                logger.debug(f"  [{slug}] Down book: best_bid={down_bid:.4f} best_ask={down_price:.4f} spread={down_price-down_bid:.4f}")
         else:
             up_price, down_price = await self._get_share_prices_rest(
                 client, info["up_token_id"], info["down_token_id"]
@@ -1008,14 +1098,89 @@ class FrequencyOptimizedTrader:
             if info["best_qualifying_price"] is None or share_price < info["best_qualifying_price"]:
                 info["best_qualifying_price"] = share_price
 
-            # Reject phantom quotes
+            # Log order book for the chosen side
+            _chosen_tok = info.get("up_token_id", "") if side == "Up" else info.get("down_token_id", "")
+            _ob_bid = self.clob_ws.get_best_bid(_chosen_tok) or 0
+            _ob_ask = self.clob_ws.get_price(_chosen_tok) or share_price
+            logger.info(f"  [{slug}] Order book: best_bid={_ob_bid:.4f} best_ask={_ob_ask:.4f} spread={_ob_ask-_ob_bid:.4f}")
+
+            # Reject below-minimum entries (MIN_ENTRY_PRICE=0.80 filters coin-flip bets)
             if share_price < MIN_ENTRY_PRICE:
-                logger.warning(f"  [{slug}] REJECTED phantom price {share_price:.4f}")
+                logger.warning(f"  [{slug}] REJECTED price {share_price:.4f} < MIN_ENTRY_PRICE={MIN_ENTRY_PRICE}")
                 return
 
-            # Execute paper trade
+            # ── Dynamic trade sizing based on order book depth ──
+            # Cap trade size to what can be filled cleanly within acceptable price.
+            # Identical logic for paper and live — paper P&L matches live.
             distance = abs(asset_price - info["price_to_beat"])
-            bet_amount = min(self.bankroll * crypto_params["POSITION_SIZE"], MAX_TRADE_SIZE)
+            desired_size = min(self.bankroll * crypto_params["POSITION_SIZE"], MAX_TRADE_SIZE)
+
+            _chosen_token = info.get("up_token_id", "") if side == "Up" else info.get("down_token_id", "")
+            max_acceptable_price = min(share_price + PRICE_BUFFER, 0.99)
+
+            # Try WS cached depth first, then REST fallback
+            ws_age = self.clob_ws.price_age_ms(_chosen_token)
+            available_shares = 0.0
+            available_usd = 0.0
+            liq_source = "none"
+
+            if ws_age < 10_000:
+                available_shares, available_usd = self.clob_ws.get_available_liquidity(
+                    _chosen_token, max_acceptable_price
+                )
+                if available_usd > 0:
+                    liq_source = "WS"
+
+            if available_usd <= 0:
+                # REST fallback — query full book
+                try:
+                    book_resp = await client.get(
+                        f"{CLOB_API}/book",
+                        params={"token_id": _chosen_token},
+                        timeout=3,
+                    )
+                    if book_resp.status_code == 200:
+                        book_data = book_resp.json()
+                        rest_asks = book_data.get("asks", [])
+                        for a in rest_asks:
+                            p = float(a.get("price", 0))
+                            s = float(a.get("size", 0))
+                            if s > 0 and p <= max_acceptable_price:
+                                available_shares += s
+                                available_usd += p * s
+                        liq_source = "REST"
+                except Exception as liq_err:
+                    logger.warning(f"  [{slug}] Liquidity check failed ({liq_err}), using desired size")
+                    available_usd = desired_size  # allow trade if check fails
+                    liq_source = "fallback"
+
+            # Cap trade size to available liquidity
+            actual_size = min(desired_size, available_usd)
+            liquidity_adjusted = actual_size < desired_size
+
+            if available_usd <= 0:
+                logger.info(f"  [{slug}] SKIP: no asks at <={max_acceptable_price:.2f} — would not fill")
+                return
+
+            if actual_size < MIN_TRADE_SIZE:
+                logger.info(
+                    f"  [{slug}] Insufficient liquidity: ${available_usd:.2f} available at <={max_acceptable_price:.2f}, "
+                    f"need ${MIN_TRADE_SIZE:.2f} min"
+                )
+                return
+
+            if liquidity_adjusted:
+                logger.info(
+                    f"  [{slug}] Liquidity-adjusted size: ${desired_size:.2f} -> ${actual_size:.2f} "
+                    f"(book has ${available_usd:.2f} at <={max_acceptable_price:.2f}, {liq_source})"
+                )
+            else:
+                logger.info(
+                    f"  [{slug}] Liquidity OK ({liq_source}): ${available_usd:.2f} available vs ${actual_size:.2f} needed"
+                )
+
+            bet_amount = actual_size
+            ask_liquidity = available_usd
 
             # Apply simulated slippage for paper mode (makes paper P&L more realistic)
             if self.mode == "paper":
@@ -1046,14 +1211,22 @@ class FrequencyOptimizedTrader:
                 "price_to_beat": info["price_to_beat"],
                 "entry_time": now,
                 "entry_source": source,
+                "available_liquidity_usd": round(available_usd, 2),
+                "liquidity_adjusted": liquidity_adjusted,
+                "original_size": round(desired_size, 2),
+                "actual_size": round(actual_size, 2),
                 "entry_delay_ms": (time.time() - info["first_qualified_at"]) * 1000 if info["first_qualified_at"] else 0,
             }
 
             self._markets_traded += 1
+            _liq_str = f"liq=${ask_liquidity:.0f}" if ask_liquidity > 0 else "liq=REST"
+            _adj_str = f" [ADJUSTED ${desired_size:.0f}->${actual_size:.0f}]" if liquidity_adjusted else ""
+            _vol_raw = self.rolling_vol.get_vol(crypto_key, fallback=cfg.get("volatility_1sec", 2.5))
+            _edge = est_prob - share_price
             logger.info(
                 f"*** TRADE [{cfg['name']}|{info['tf']}] {slug} | {side} @ {share_price:.3f} | "
-                f"Bet=${bet_amount:.2f} | Prob={est_prob:.4f} | "
-                f"Dist=${distance:,.6g} | t-{remaining}s | via={source}"
+                f"Bet=${bet_amount:.2f} | Prob={est_prob:.4f} | Edge={_edge:.4f} | "
+                f"Dist=${distance:,.6g} | t-{remaining}s | vol={_vol_raw:.2f}x1.5 | {_liq_str}{_adj_str} | via={source}"
             )
 
             # Execute real trade if in shadow/live mode
@@ -1099,20 +1272,20 @@ class FrequencyOptimizedTrader:
             })
             return
 
-        # Determine trade size
+        # Determine trade size (respects liquidity cap from paper evaluation)
         if self.mode == "shadow":
             trade_size = SHADOW_TRADE_SIZE
         elif self.mode == "live":
             balance = await self.trader.get_balance()
-            crypto_cfg = CRYPTO_CONFIGS.get(crypto_key, {})
-            position_pct = crypto_cfg.get("position_size", 0.05)
-            trade_size = min(balance * position_pct, MAX_TRADE_SIZE)
+            # Use liquidity-capped size from position info, then apply live caps
+            liq_capped = info.get("position", {}).get("actual_size", MAX_TRADE_SIZE)
+            trade_size = min(balance * 0.05, liq_capped, MAX_TRADE_SIZE)
         else:
             return
 
-        if trade_size < 0.10:
-            logger.info("[%s] Trade size $%.2f too small, skipping real trade",
-                        cfg["name"], trade_size)
+        if trade_size < 1.0 or (self.mode == "live" and trade_size > balance):
+            logger.info("[%s] Trade size $%.2f not viable (balance=$%.2f), skipping",
+                        cfg["name"], trade_size, await self.trader.get_balance() if self.mode == "live" else 0)
             return
 
         # Token ID
@@ -1125,6 +1298,18 @@ class FrequencyOptimizedTrader:
             logger.error("[%s] No token_id for side=%s in %s",
                          cfg["name"], side, slug)
             return
+
+        # Log order book state at execution time
+        _up_bid = self.clob_ws.get_best_bid(info.get("up_token_id", ""))
+        _up_ask = self.clob_ws.get_price(info.get("up_token_id", ""))
+        _dn_bid = self.clob_ws.get_best_bid(info.get("down_token_id", ""))
+        _dn_ask = self.clob_ws.get_price(info.get("down_token_id", ""))
+        logger.info(
+            "[%s] Order book at execution: Up bid=%.4f ask=%.4f | Down bid=%.4f ask=%.4f",
+            cfg["name"],
+            _up_bid or 0, _up_ask or 0,
+            _dn_bid or 0, _dn_ask or 0,
+        )
 
         logger.info(
             "[%s] EXECUTING %s TRADE: %s @ %.4f | size=$%.2f | market=%s",
@@ -1139,6 +1324,7 @@ class FrequencyOptimizedTrader:
                 size_usd=trade_size,
                 price=share_price,
                 market_slug=slug,
+                estimated_prob=est_prob,
             )
 
             # Check fill ratio
@@ -1148,9 +1334,11 @@ class FrequencyOptimizedTrader:
                                cfg["name"], fill_ratio * 100)
 
             # Only proceed if something actually filled
-            actual_filled = result.get("filled_size", trade_size)
-            if actual_filled <= 0:
-                logger.warning("[%s] Zero fill — no position recorded", cfg["name"])
+            order_success = result.get("success", False)
+            actual_filled = result.get("filled_size", 0)
+            if not order_success or actual_filled <= 0:
+                logger.warning("[%s] Zero fill — no position recorded (success=%s filled=$%.2f)",
+                               cfg["name"], order_success, actual_filled)
                 return
         except Exception as e:
             logger.error("[%s] Order execution failed: %s", cfg["name"], e)
@@ -1165,7 +1353,7 @@ class FrequencyOptimizedTrader:
             return
 
         # Record live position
-        actual_trade_size = result.get("filled_size", trade_size) if result.get("fill_ratio", 1) > 0 else trade_size
+        actual_trade_size = result.get("filled_size", trade_size) if result.get("fill_ratio", 0) > 0 else trade_size
         self._live_positions[slug] = {
             "crypto_key": crypto_key,
             "crypto_name": cfg["name"],
@@ -1183,7 +1371,7 @@ class FrequencyOptimizedTrader:
         }
 
         # Only call safety.record_trade() if something actually filled
-        if result.get("fill_ratio", 1) > 0:
+        if result.get("success", False) and result.get("fill_ratio", 0) > 0:
             await self.safety.record_trade(self._live_positions[slug])
         self._save_v21_state()
 
@@ -1310,6 +1498,24 @@ class FrequencyOptimizedTrader:
         # Calculate P&L
         pos = info["position"]
         won = pos["side"] == outcome
+
+        # Check if we have a real CLOB trade for this market
+        live_pos = self._live_positions.get(slug)
+        if live_pos and self.mode != "paper":
+            # Use ACTUAL CLOB amounts (not paper-sized)
+            real_bet = live_pos.get("trade_size_usd", 0)
+            # Get real shares from order result's takingAmount
+            raw = str(live_pos.get("order_result", {}).get("raw_result", ""))
+            taking_match = re.search(r"'takingAmount':\s*'([\d.]+)'", raw)
+            real_shares = float(taking_match.group(1)) if taking_match else (real_bet / pos["entry_price"] if pos["entry_price"] > 0 else 0)
+            real_payout = real_shares * 1.0 if won else 0.0
+            # For CLOB trades, fee is already embedded in the fill price
+            real_net = real_payout - real_bet
+            net_profit_real = real_net
+            logger.info(f"  [{cfg['name']}] CLOB P&L: bet=${real_bet:.4f} shares={real_shares:.4f} payout=${real_payout:.4f} net=${real_net:+.4f} {'WIN' if won else 'LOSS'}")
+        else:
+            net_profit_real = None  # paper trade, no real amounts
+
         payout = calculate_payout(pos["shares"], won)
         fee = calculate_fee(pos["bet_amount"], pos["entry_price"], POLY_CRYPTO_FEE_RATE)
         net_profit = (payout - pos["bet_amount"] - fee) if won else (-pos["bet_amount"] - fee)
@@ -1336,6 +1542,12 @@ class FrequencyOptimizedTrader:
             "btc_distance": round(pos.get("btc_distance", pos.get("asset_distance", 0)), 2),
             "timestamp": pos["entry_time"],
             "entry_source": pos.get("entry_source", "unknown"),
+            "mode": pos.get("mode", self.mode),
+            "order_id": pos.get("order_result", {}).get("order_id", ""),
+            "available_liquidity_usd": pos.get("available_liquidity_usd", 0),
+            "liquidity_adjusted": pos.get("liquidity_adjusted", False),
+            "original_size": pos.get("original_size", 0),
+            "actual_size": pos.get("actual_size", 0),
         }
         self.trades.append(trade)
         self._save_trade(trade)
@@ -1357,12 +1569,27 @@ class FrequencyOptimizedTrader:
 
         # Update safety manager for real trades
         if self.mode != "paper" and slug in self._live_positions:
-            await self.safety.record_result(won, net_profit)
-            if won:
-                self.real_pnl_total += net_profit
-            else:
-                self.real_pnl_total += net_profit
+            # Use actual CLOB P&L if available, not paper-sized P&L
+            actual_pnl = net_profit_real if net_profit_real is not None else net_profit
+            await self.safety.record_result(won, actual_pnl)
+            self.real_pnl_total += actual_pnl
             self.real_trade_count += 1
+            # Log settlement to trades.jsonl for CLOB Order Log display
+            live_pos = self._live_positions[slug]
+            append_jsonl(TRADE_LOG, {
+                "timestamp": time.time(),
+                "type": "trade_settled",
+                "market_slug": slug,
+                "crypto_key": crypto_key,
+                "side": pos["side"],
+                "outcome": outcome,
+                "won": won,
+                "bet_amount": live_pos.get("trade_size_usd", 0),
+                "payout": (float(taking_match.group(1)) if taking_match else 0) if won else 0,
+                "net_profit": round(actual_pnl, 6),
+                "real_pnl_total": round(self.real_pnl_total, 6),
+                "order_id": live_pos.get("order_result", {}).get("order_id", ""),
+            })
             del self._live_positions[slug]
             self._save_v21_state()
 

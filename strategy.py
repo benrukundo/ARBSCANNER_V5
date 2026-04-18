@@ -48,7 +48,11 @@ def _core_evaluate(
     """
     min_distance = params.get("MIN_DISTANCE", params.get("MIN_BTC_DISTANCE", 50.0))
     min_edge = params["MIN_EDGE"]
-    vol_per_sec = params.get("VOLATILITY_1SEC", params.get("BTC_1SEC_VOLATILITY", 2.5))
+    vol_per_sec_raw = params.get("VOLATILITY_1SEC", params.get("BTC_1SEC_VOLATILITY", 2.5))
+
+    # Apply safety multiplier — rolling vol underestimates true vol during calm periods
+    from config import VOL_SAFETY_MULTIPLIER
+    vol_per_sec = vol_per_sec_raw * VOL_SAFETY_MULTIPLIER
 
     if time_remaining_seconds < 5:
         return False, None, None, None
@@ -76,7 +80,18 @@ def _core_evaluate(
     if share_price <= 0 or share_price > MAX_ENTRY_PRICE_ABS:
         return False, None, None, None
 
+    # Enforce minimum entry price — reject cheap/coin-flip bets
+    from config import MIN_ENTRY_PRICE
+    if share_price < MIN_ENTRY_PRICE:
+        logger.info("Rejected: share_price=%.4f < MIN_ENTRY_PRICE=%.2f", share_price, MIN_ENTRY_PRICE)
+        return False, None, None, None
+
     edge = estimated_prob - share_price
+    logger.debug(
+        "  eval: dist=$%.2f t=%ds vol_raw=%.2f vol_adj=%.2f z=%.3f prob=%.4f price=%.3f edge=%.4f min_edge=%.3f",
+        abs_distance, time_remaining_seconds, vol_per_sec_raw, vol_per_sec,
+        z_score, estimated_prob, share_price, edge, min_edge,
+    )
     if edge < min_edge:
         return False, None, None, None
 

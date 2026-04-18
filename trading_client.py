@@ -9,6 +9,7 @@ from config import (
     PRIVATE_KEY, FUNDER_ADDRESS, SIGNATURE_TYPE,
     API_KEY, API_SECRET, API_PASSPHRASE,
     TRADE_LOG, ERROR_LOG, DATA_DIR,
+    PRICE_BUFFER, MIN_ENTRY_PRICE,
 )
 
 logger = logging.getLogger("v21.trading_client")
@@ -70,14 +71,24 @@ class PolymarketTrader:
                     signature_type=SIGNATURE_TYPE,
                 )
                 creds = temp_client.derive_api_key()
-                api_key = creds.get("apiKey", "")
-                api_secret = creds.get("secret", "")
-                api_passphrase = creds.get("passphrase", "")
+                # derive_api_key() may return ApiCreds object or dict
+                if hasattr(creds, 'api_key'):
+                    # ApiCreds object
+                    api_key = creds.api_key
+                    api_secret = creds.api_secret
+                    api_passphrase = creds.api_passphrase
+                elif isinstance(creds, dict):
+                    api_key = creds.get("apiKey", "")
+                    api_secret = creds.get("secret", "")
+                    api_passphrase = creds.get("passphrase", "")
+                else:
+                    raise ValueError(f"Unexpected creds type: {type(creds)}")
 
                 # Cache for next restart
                 os.makedirs(DATA_DIR, exist_ok=True)
+                creds_dict = {"apiKey": api_key, "secret": api_secret, "passphrase": api_passphrase}
                 with open(creds_file, "w") as f:
-                    json.dump(creds, f, indent=2)
+                    json.dump(creds_dict, f, indent=2)
                 logger.info("API credentials derived and cached")
 
             # Create authenticated client
@@ -101,7 +112,11 @@ class PolymarketTrader:
             self._fee_supported = True
             try:
                 import py_clob_client
-                clob_version = getattr(py_clob_client, "__version__", "0.0.0")
+                try:
+                    from importlib.metadata import version as _get_version
+                    clob_version = _get_version("py-clob-client")
+                except Exception:
+                    clob_version = getattr(py_clob_client, "__version__", "0.0.0")
                 from packaging.version import Version
                 if Version(clob_version) < Version("0.15.0"):
                     self._fee_supported = False
@@ -133,7 +148,10 @@ class PolymarketTrader:
         if now - self._balance_cache[1] < 30:
             return self._balance_cache[0]
         try:
-            raw = self.client.get_balance_allowance()
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=SIGNATURE_TYPE)
+            raw = self.client.get_balance_allowance(params)
+            logger.info("RAW balance response: %s", raw)
             balance = float(raw.get("balance", 0)) / 1e6  # USDC 6 decimals
             self._balance_cache = (balance, now)
             logger.info("Wallet balance: $%.2f", balance)
@@ -143,10 +161,15 @@ class PolymarketTrader:
             return self._balance_cache[0]
 
     async def place_order(self, token_id: str, side: str, size_usd: float,
-                          price: float, market_slug: str = "") -> dict:
-        """Place a FAK order on the CLOB."""
-        from py_clob_client.clob_types import OrderArgs, OrderType
+                          price: float, market_slug: str = "",
+                          estimated_prob: float = None) -> dict:
+        """Place a FAK order on the CLOB using MarketOrderArgs (USDC-based).
 
+        Uses create_market_order instead of create_order to avoid CLOB API
+        'invalid amounts' errors. MarketOrderArgs takes USDC amount directly,
+        ensuring maker_amount (USDC) stays at ≤2 decimal precision.
+        """
+        from py_clob_client.clob_types import MarketOrderArgs, OrderType
 
         # ── CRITICAL: Verify fee support before placing any order ──
         if hasattr(self, "_fee_supported") and not self._fee_supported:
@@ -185,42 +208,90 @@ class PolymarketTrader:
         })
 
         try:
-            num_shares = size_usd / price
-            logger.info("Placing order: %s %.4f shares @ %.4f ($%.2f) | %s",
-                        side, num_shares, price, size_usd, market_slug)
+            # Round USDC amount to 2 decimals (cents) — ensures maker precision
+            amount = round(size_usd, 2)
 
-            # Get tick size for rounding
-            tick_size = "0.01"
-            try:
-                market_info = self.client.get_market(token_id)
-                if market_info and "minimum_tick_size" in market_info:
-                    tick_size = str(market_info["minimum_tick_size"])
-            except Exception:
-                pass
+            # ── Apply PRICE_BUFFER for reliable FAK fills ──
+            MAX_ENTRY_PRICE = 0.95
+            MAX_ENTRY_PRICE_ABS = 0.99
+            MIN_EDGE = 0.03
 
-            # Round price to tick size
-            tick = float(tick_size)
-            rounded_price = round(round(price / tick) * tick, 4)
+            market_ask = round(price, 2)
+            buffered_price = round(min(market_ask + PRICE_BUFFER, MAX_ENTRY_PRICE), 2)
+            logger.info("Price buffer: market_ask=%.4f -> order=%.4f (buffer=%.2f)",
+                        market_ask, buffered_price, PRICE_BUFFER)
 
-            order_args = OrderArgs(
+            # Safety check: cap at MAX_ENTRY_PRICE
+            if buffered_price > MAX_ENTRY_PRICE:
+                logger.warning("Buffered price %.4f > MAX_ENTRY_PRICE %.2f — capping",
+                               buffered_price, MAX_ENTRY_PRICE)
+                buffered_price = MAX_ENTRY_PRICE
+
+            # Safety check: reject above MAX_ENTRY_PRICE_ABS
+            if buffered_price > MAX_ENTRY_PRICE_ABS:
+                logger.warning("Buffered price %.4f > MAX_ENTRY_PRICE_ABS %.2f — rejecting",
+                               buffered_price, MAX_ENTRY_PRICE_ABS)
+                return {
+                    "success": False, "order_id": None, "status": "price_too_high",
+                    "filled_size": 0, "intended_size": size_usd, "fill_ratio": 0, "slippage": 0,
+                }
+
+            # Recalculate edge after buffer
+            if estimated_prob is not None:
+                edge_after_buffer = estimated_prob - buffered_price
+                logger.info("Edge after buffer: est_prob=%.4f - buffered=%.4f = edge=%.4f (min=%.2f)",
+                            estimated_prob, buffered_price, edge_after_buffer, MIN_EDGE)
+                if edge_after_buffer < MIN_EDGE:
+                    logger.info("SKIPPED: edge_after_buffer=%.4f < MIN_EDGE=%.2f — buffer eats the edge",
+                                edge_after_buffer, MIN_EDGE)
+                    return {
+                        "success": False, "order_id": None, "status": "edge_too_thin_after_buffer",
+                        "filled_size": 0, "intended_size": size_usd, "fill_ratio": 0, "slippage": 0,
+                        "edge_after_buffer": edge_after_buffer,
+                    }
+
+            # Recalculate fee using buffered price
+            fee = (amount / buffered_price) * 0.072 * buffered_price * (1 - buffered_price) if buffered_price > 0 else 0
+            logger.info("Fee at buffered price: $%.4f (%.2f%%)", fee, (fee / amount * 100) if amount > 0 else 0)
+
+            rounded_price = buffered_price
+            logger.info("Placing market order: %s $%.2f @ %.4f (ask=%.4f + buffer) | %s",
+                        side, amount, rounded_price, market_ask, market_slug)
+
+            order_args = MarketOrderArgs(
                 token_id=token_id,
+                amount=amount,
                 price=rounded_price,
-                size=round(num_shares, 2),
                 side=side,
             )
 
-            signed_order = self.client.create_order(order_args)
-            result = self.client.post_order(signed_order, order_type=OrderType.FAK)
-
+            signed_order = self.client.create_market_order(order_args)
+            result = self.client.post_order(signed_order, orderType=OrderType.FAK)
 
             order_id = result.get("orderID", result.get("id", "unknown"))
             status = result.get("status", "unknown")
 
             # ── Track actual fill amounts from FAK orders ──
-            filled_amount = float(result.get("filled_size", result.get("matchedAmount", 0)))
+            # CLOB response keys: makingAmount (USDC paid), takingAmount (shares),
+            # status ("matched" = filled), success (True/False)
             intended_amount = size_usd
+            is_success = result.get("success", False)
+            matched = result.get("status", "") == "matched"
+
+            if is_success and matched:
+                # Order filled — makingAmount = USDC paid (for BUY)
+                making = result.get("makingAmount", "0")
+                filled_amount = float(making) if making else 0.0
+                if filled_amount <= 0:
+                    filled_amount = intended_amount  # fallback — success=True means it filled
+                logger.info("Order FILLED: makingAmount=%s takingAmount=%s txns=%s",
+                            making, result.get("takingAmount", "0"),
+                            result.get("transactionsHashes", []))
+            else:
+                # Not matched — try legacy keys as fallback
+                filled_amount = float(result.get("filled_size", result.get("matchedAmount", 0)))
+
             fill_ratio = filled_amount / intended_amount if intended_amount > 0 else 0
-            slippage = abs(rounded_price - price) if filled_amount > 0 else 0
 
             logger.info("Fill ratio: %.1f%% (filled $%.2f of $%.2f)",
                         fill_ratio * 100, filled_amount, intended_amount)
@@ -233,11 +304,14 @@ class PolymarketTrader:
                 "token_id": token_id,
                 "side": side,
                 "size_usd": size_usd,
-                "price": rounded_price,
+                "market_ask": market_ask,
+                "buffered_price": buffered_price,
+                "price_buffer": PRICE_BUFFER,
                 "market_slug": market_slug,
                 "filled_size": filled_amount,
                 "intended_size": intended_amount,
                 "fill_ratio": fill_ratio,
+                "estimated_prob": estimated_prob,
                 "raw_result": str(result)[:500],
             })
 
@@ -249,25 +323,59 @@ class PolymarketTrader:
                 "filled_size": filled_amount,
                 "intended_size": intended_amount,
                 "fill_ratio": fill_ratio,
-                "slippage": slippage,
-                "avg_price": rounded_price,
+                "slippage": 0,
+                "avg_price": price,
             }
 
         except Exception as e:
+            error_str = str(e)
+            # FAK/GTC no-fill: order was valid but no matching liquidity
+            # Extract orderID from error if present (order WAS accepted)
+            import re as _re
+            oid_match = _re.search(r'orderID.*?(0x[a-fA-F0-9]{20,})', error_str)
+            extracted_oid = oid_match.group(1) if oid_match else None
+            if "no orders found to match" in error_str:
+                # FAK order had no matching liquidity at this price — this is
+                # expected behaviour, NOT an error.  Log and move on.
+                logger.info(
+                    "FAK order not filled — no liquidity at %.4f for %s (orderID=%s). Moving on.",
+                    price, market_slug, extracted_oid or "unknown",
+                )
+                append_jsonl(TRADE_LOG, {
+                    "timestamp": time.time(),
+                    "type": "order_no_fill",
+                    "order_id": extracted_oid,
+                    "token_id": token_id,
+                    "side": side,
+                    "size_usd": size_usd,
+                    "price": price,
+                    "market_slug": market_slug,
+                    "reason": "FAK_no_liquidity",
+                })
+                return {
+                    "success": False,
+                    "order_id": extracted_oid,
+                    "status": "no_fill",
+                    "filled_size": 0,
+                    "intended_size": size_usd,
+                    "fill_ratio": 0,
+                    "slippage": 0,
+                    "avg_price": price,
+                }
             log_error(f"Order placement failed: {e}", e)
             append_jsonl(TRADE_LOG, {
                 "timestamp": time.time(),
                 "type": "order_error",
-                "error": str(e),
+                "error": error_str,
                 "token_id": token_id,
                 "side": side,
                 "size_usd": size_usd,
             })
             return {
                 "success": False,
-                "order_id": None,
+                "order_id": extracted_oid,
                 "status": "exception",
-                "error": str(e),
+                "error": error_str,
             }
 
     async def get_open_orders(self) -> list:

@@ -66,7 +66,7 @@ CRYPTO_CONFIGS = {
         "timeframes": ["5m", "15m"],
         "volatility_1sec": 2.5,
         "min_distance": 50.0,
-        "position_size": 0.05,
+        "position_size": 0.10,
         "min_ptb": 1000,  # price-to-beat must be > this to be valid
     },
     "eth": {
@@ -79,7 +79,7 @@ CRYPTO_CONFIGS = {
         "timeframes": ["5m", "15m"],
         "volatility_1sec": 0.35,
         "min_distance": 5.0,
-        "position_size": 0.05,
+        "position_size": 0.10,
         "min_ptb": 100,
     },
     "sol": {
@@ -92,7 +92,7 @@ CRYPTO_CONFIGS = {
         "timeframes": ["5m", "15m"],
         "volatility_1sec": 0.015,
         "min_distance": 0.30,
-        "position_size": 0.05,
+        "position_size": 0.10,
         "min_ptb": 1,
     },
     "xrp": {
@@ -105,7 +105,7 @@ CRYPTO_CONFIGS = {
         "timeframes": ["5m", "15m"],
         "volatility_1sec": 0.00015,
         "min_distance": 0.005,          # increased from 0.003 to reduce false entries
-        "position_size": 0.05,
+        "position_size": 0.10,
         "min_ptb": 0.01,
     },
     "doge": {
@@ -118,7 +118,7 @@ CRYPTO_CONFIGS = {
         "timeframes": ["5m", "15m"],
         "volatility_1sec": 0.000015,
         "min_distance": 0.0005,         # increased from 0.0003 to reduce false entries
-        "position_size": 0.05,
+        "position_size": 0.10,
         "min_ptb": 0.001,
     },
     "bnb": {
@@ -131,7 +131,7 @@ CRYPTO_CONFIGS = {
         "timeframes": ["5m", "15m"],
         "volatility_1sec": 0.08,
         "min_distance": 1.5,
-        "position_size": 0.05,
+        "position_size": 0.10,
         "min_ptb": 10,
     },
 }
@@ -155,12 +155,18 @@ WS_RECONNECT_DELAY = 2
 WS_PING_INTERVAL = 10
 WS_FALLBACK_POLL_INTERVAL = 1   # was 2, reduced for faster fallback on 5-min markets
 
+# ── Volatility Safety ─────────────────────────────────────────
+# Rolling vol from Binance trades underestimates true vol by ~2x during
+# calm periods. This multiplier inflates it to be conservative, preventing
+# overconfident entries at 0.80 that lose $100 when wrong.
+VOL_SAFETY_MULTIPLIER = 1.5
+
 # ── Strategy Defaults (wider 300s entry window) ──────────────
 DEFAULT_STRATEGY_PARAMS = {
     "MAX_TIME_REMAINING": 300,      # 5 minutes — wider than V1's 120s
     "MIN_BTC_DISTANCE": 50.0,
     "MAX_ENTRY_PRICE": 0.95,
-    "MIN_EDGE": 0.03,
+    "MIN_EDGE": 0.06,               # was 0.03 — doubled to require stronger edge
     "POSITION_SIZE": 0.05,
     "BTC_1SEC_VOLATILITY": 2.5,
 }
@@ -178,7 +184,7 @@ PAPER_INITIAL_BANKROLL = 100.0
 PAPER_CHECK_INTERVAL = 2   # faster fallback polling than V1's 5s
 
 # ── Safety ────────────────────────────────────────────────────
-MIN_ENTRY_PRICE = 0.05     # reject phantom quotes below this
+MIN_ENTRY_PRICE = 0.80     # minimum entry price — rejects any bet below $0.80
 
 # ── Fees ──────────────────────────────────────────────────────
 POLY_CRYPTO_FEE_RATE = 0.072
@@ -201,7 +207,9 @@ SHADOW_TRADE_SIZE = 1.0         # $ per trade in shadow mode
 # Position sizing: 5% of bankroll, capped at $100 max per trade
 # This means the bot scales naturally up to $2,000 bankroll before the cap kicks in
 # $100 stays within single-level liquidity and won't dominate market volume
-MAX_TRADE_SIZE = 100.0           # hard cap on any single trade
+MAX_TRADE_SIZE = 100.0              # hard cap on any single trade
+MIN_TRADE_SIZE = 1.00               # minimum trade size — skip if liquidity below this
+PRICE_BUFFER = 0.02                 # buffer added to best ask for reliable FAK fills
 MIN_BALANCE_TO_TRADE = 10.0     # minimum wallet balance to trade
 
 # ── Safety Limits ─────────────────────────────────────────────
@@ -224,10 +232,15 @@ CHAIN_ID = 137
 # ── Wallet (from .env) ───────────────────────────────────────
 PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 FUNDER_ADDRESS = os.getenv("POLYMARKET_FUNDER_ADDRESS", "")
-SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "2"))
+SIGNATURE_TYPE = int(os.getenv("POLYMARKET_SIGNATURE_TYPE", "1"))
 API_KEY = os.getenv("POLYMARKET_API_KEY", "")
 API_SECRET = os.getenv("POLYMARKET_API_SECRET", "")
 API_PASSPHRASE = os.getenv("POLYMARKET_PASSPHRASE", "")
 
 # ── Dashboard ─────────────────────────────────────────────────
 DASHBOARD_PORT = 8085
+
+#  Builder API (for auto-redeem) 
+BUILDER_API_KEY = os.getenv('POLYMARKET_BUILDER_API_KEY', '')
+BUILDER_SECRET = os.getenv('POLYMARKET_BUILDER_SECRET', '')
+BUILDER_PASSPHRASE = os.getenv('POLYMARKET_BUILDER_PASSPHRASE', '')
