@@ -77,10 +77,13 @@ async def paper_stop():
 # ── Trade History ─────────────────────────────────────────────
 
 @app.get("/api/paper/trades")
-async def paper_trades(limit: int = 100):
+async def paper_trades(limit: int = 0):
     if not _trader:
         return []
-    return _trader.trades[-limit:]
+    trades = list(reversed(_trader.trades)) if _trader.trades else []
+    if limit > 0:
+        return trades[:limit]
+    return trades
 
 
 # ── Equity Curve ──────────────────────────────────────────────

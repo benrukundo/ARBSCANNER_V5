@@ -116,7 +116,34 @@
 
         <!-- Trade Table -->
         <div class="table-container">
-            <h3>Trade History</h3>
+            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:10px;">
+                <h3 style="margin:0;">Trade History</h3>
+                <div id="trade-filter-pnl" style="font-size:18px;font-weight:bold;color:#4caf50;">
+                    Total P&amp;L: <span id="filtered-pnl">$0.00</span>
+                    <span style="font-size:13px;color:#888;margin-left:8px;">(<span id="filtered-count">0</span> trades)</span>
+                    <span style="margin-left:20px;">
+                        <button onclick="prevPage()" id="btn-prev" style="background:#333;color:#e2e8f0;border:1px solid #555;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:12px;">&laquo; Prev</button>
+                        <span id="page-info" style="font-size:12px;color:#aaa;margin:0 8px;">Page 1</span>
+                        <button onclick="nextPage()" id="btn-next" style="background:#333;color:#e2e8f0;border:1px solid #555;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:12px;">Next &raquo;</button>
+                        <select id="page-size" onchange="changePageSize()" style="background:#1a1a2e;color:#e2e8f0;border:1px solid #555;border-radius:4px;padding:3px;margin-left:8px;font-size:12px;">
+                            <option value="25">25/page</option>
+                            <option value="50" selected>50/page</option>
+                            <option value="100">100/page</option>
+                            <option value="0">All</option>
+                        </select>
+                    </span>
+                </div>
+            </div>
+            <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px;flex-wrap:wrap;">
+                <label style="color:#a0aec0;font-size:13px;">From:
+                    <input type="date" id="filter-start-date" style="background:#1a1a2e;color:#e2e8f0;border:1px solid #555;border-radius:4px;padding:4px 8px;margin-left:4px;">
+                </label>
+                <label style="color:#a0aec0;font-size:13px;">To:
+                    <input type="date" id="filter-end-date" style="background:#1a1a2e;color:#e2e8f0;border:1px solid #555;border-radius:4px;padding:4px 8px;margin-left:4px;">
+                </label>
+                <button onclick="applyTradeFilter()" style="background:#2196f3;color:#fff;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:13px;">Filter</button>
+                <button onclick="clearTradeFilter()" style="background:#555;color:#fff;border:none;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:13px;">Clear</button>
+            </div>
             <table>
                 <thead>
                     <tr>
@@ -381,10 +408,84 @@
                 document.getElementById('crypto-pnl-panel').textContent = 'No trades yet';
             }
 
-            // Trade Table
-            const tbody = document.getElementById('trade-tbody');
-            tbody.innerHTML = '';
-            (s.recent_trades || []).slice().reverse().forEach((t, i) => {
+            // Trade Table — store all trades globally for filtering
+            window._allTrades = (s.recent_trades || []).slice().reverse();
+            window._serverTotalProfit = s.total_profit || 0;
+            renderFilteredTrades();
+
+            // Equity Curve
+            const ec = await (await fetch('/api/paper/equity-curve')).json();
+            if (ec.labels && ec.labels.length > 0) {
+                equityChart.data.labels = ec.labels;
+                equityChart.data.datasets[0].data = ec.data;
+                equityChart.update();
+            }
+        } catch (e) {
+            console.error('Refresh error:', e);
+        }
+    }
+
+    // ── Trade Filter Logic ──
+    // ── Pagination state ──
+    let _currentPage = 1;
+    let _pageSize = 50;
+    let _filteredTrades = [];
+
+    function renderFilteredTrades() {
+        const allTrades = window._allTrades || [];
+        const startInput = document.getElementById('filter-start-date').value;
+        const endInput = document.getElementById('filter-end-date').value;
+        const hasFilter = !!(startInput || endInput);
+
+        let filtered = allTrades;
+        if (startInput) {
+            const startTs = new Date(startInput + 'T00:00:00').getTime() / 1000;
+            filtered = filtered.filter(t => t.timestamp >= startTs);
+        }
+        if (endInput) {
+            const endTs = new Date(endInput + 'T00:00:00').getTime() / 1000 + 86400;
+            filtered = filtered.filter(t => t.timestamp < endTs);
+        }
+
+        _filteredTrades = filtered;
+
+        // Compute P&L: use server total_profit when unfiltered, otherwise sum filtered
+        let totalPnl;
+        if (!hasFilter && window._serverTotalProfit !== undefined) {
+            totalPnl = window._serverTotalProfit;
+        } else {
+            totalPnl = 0;
+            filtered.forEach(t => { totalPnl += (t.net_profit || 0); });
+        }
+        const pnlEl = document.getElementById('filtered-pnl');
+        pnlEl.textContent = (totalPnl >= 0 ? '+' : '') + '$' + totalPnl.toFixed(4);
+        pnlEl.style.color = totalPnl >= 0 ? '#4caf50' : '#f44336';
+        document.getElementById('filtered-count').textContent = filtered.length;
+
+        // Reset to page 1 on filter change
+        _currentPage = 1;
+        renderPage();
+    }
+
+    function renderPage() {
+        const filtered = _filteredTrades;
+        const totalPages = _pageSize > 0 ? Math.max(1, Math.ceil(filtered.length / _pageSize)) : 1;
+        if (_currentPage > totalPages) _currentPage = totalPages;
+
+        const start = _pageSize > 0 ? (_currentPage - 1) * _pageSize : 0;
+        const pageData = _pageSize > 0 ? filtered.slice(start, start + _pageSize) : filtered;
+
+        // Update pagination info
+        document.getElementById('page-info').textContent = _pageSize > 0
+            ? `Page ${_currentPage} of ${totalPages}`
+            : `All ${filtered.length}`;
+        document.getElementById('btn-prev').disabled = _currentPage <= 1;
+        document.getElementById('btn-next').disabled = _currentPage >= totalPages;
+
+        const tbody = document.getElementById('trade-tbody');
+        tbody.innerHTML = '';
+        pageData.forEach((t, i) => {
+            const globalIdx = start + i + 1;
                 const tfMatch = t.market_slug.match(/-updown-(\w+)-/); const tf = tfMatch ? tfMatch[1] : '5m';
                 const shortSlug = t.market_slug.replace(/^(btc|eth|sol|xrp|doge|bnb)-updown-(\w+)-/, (m,c,tf) => c.toUpperCase()+'/'+tf+':');
                 const row = document.createElement('tr');
@@ -397,7 +498,7 @@
                     ? '<span style="background:#ff9800;color:#fff;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:bold;">SHADOW</span>'
                     : '<span style="background:#4caf50;color:#fff;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:bold;">PAPER</span>';
                 row.innerHTML = `
-                    <td>${i+1}</td>
+                    <td>${globalIdx}</td>
                     <td>${modeBadge}</td>
                     <td style="white-space:nowrap;color:#718096;font-size:11px;">${formatTimestamp(t.timestamp)}</td>
                     <td>${cryptoName}</td>
@@ -414,19 +515,25 @@
                     <td>${t.time_remaining}s</td>
                     <td>${t.entry_source || '—'}</td>
                 `;
-                tbody.appendChild(row);
-            });
+            tbody.appendChild(row);
+        });
+    }
 
-            // Equity Curve
-            const ec = await (await fetch('/api/paper/equity-curve')).json();
-            if (ec.labels && ec.labels.length > 0) {
-                equityChart.data.labels = ec.labels;
-                equityChart.data.datasets[0].data = ec.data;
-                equityChart.update();
-            }
-        } catch (e) {
-            console.error('Refresh error:', e);
-        }
+    function applyTradeFilter() { renderFilteredTrades(); }
+    function clearTradeFilter() {
+        document.getElementById('filter-start-date').value = '';
+        document.getElementById('filter-end-date').value = '';
+        renderFilteredTrades();
+    }
+    function prevPage() { if (_currentPage > 1) { _currentPage--; renderPage(); } }
+    function nextPage() {
+        const totalPages = _pageSize > 0 ? Math.ceil(_filteredTrades.length / _pageSize) : 1;
+        if (_currentPage < totalPages) { _currentPage++; renderPage(); }
+    }
+    function changePageSize() {
+        _pageSize = parseInt(document.getElementById('page-size').value);
+        _currentPage = 1;
+        renderPage();
     }
 
     // ── Performance Page ──

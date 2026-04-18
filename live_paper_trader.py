@@ -1825,7 +1825,7 @@ class FrequencyOptimizedTrader:
             "total_profit": round(self.bankroll - self.initial_bankroll, 4),
             "is_running": self.is_running,
             "btc_price": self._btc_price,
-            "recent_trades": self.trades[-30:] if self.trades else [],
+            "recent_trades": list(self.trades) if self.trades else [],
             "version": VERSION,
             "active_cryptos": ACTIVE_CRYPTOS,
             # V2.1 specific
