@@ -1,4 +1,4 @@
-"""Dashboard — V2.1 Frequency Optimized Paper Trader."""
+"""Dashboard — V6 Kelly + Dynamic Exit + Hedge Paper Trader."""
 
 import asyncio
 import json
@@ -16,22 +16,121 @@ from config import (
     DASHBOARD_PORT, PAPER_INITIAL_BANKROLL, VERSION,
     PERFORMANCE_LOG_FILE, PAPER_TRADES_FILE,
     ACTIVE_CRYPTOS, CRYPTO_CONFIGS, TRADING_MODE,
+    POSITION_SIZE_MODE, KELLY_FRACTION,
+    ENABLE_DYNAMIC_EXIT, TAKE_PROFIT_PRICE, STOP_LOSS_PRICE,
+    HEDGE_INSTEAD_OF_STOP,
 )
 
-CLOB_TRADE_LOG = Path("logs/trades.jsonl")
+CLOB_TRADE_LOG = Path("logs_v7/trades.jsonl")
 from safety import SafetyManager
 from live_paper_trader import FrequencyOptimizedTrader
 
-logger = logging.getLogger("v21.dashboard")
+logger = logging.getLogger("v6.dashboard")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-app = FastAPI(title="V2.1 Frequency Optimized Paper Trader")
+app = FastAPI(title="V6 Kelly + Dynamic Exit + Hedge Paper Trader")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
 # ── Global state ──────────────────────────────────────────────
 _trader: FrequencyOptimizedTrader | None = None
 _trader_task: asyncio.Task | None = None
+
+
+def _load_clob_trade_map() -> dict[str, dict]:
+    """Return latest real CLOB execution info keyed by market slug."""
+    if not CLOB_TRADE_LOG.exists():
+        return {}
+
+    by_slug: dict[str, dict] = {}
+    with open(CLOB_TRADE_LOG) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            slug = entry.get("market_slug") or entry.get("slug")
+            if not slug:
+                continue
+
+            rec = by_slug.setdefault(slug, {
+                "real_status": "not_attempted",
+                "real_order_id": "",
+                "real_bet": 0.0,
+                "real_pnl": None,
+                "real_outcome": "",
+                "real_fill_ratio": None,
+                "real_tx": "",
+            })
+
+            etype = entry.get("type", "")
+            if etype == "order_result":
+                rec["real_status"] = "matched"
+                rec["real_order_id"] = entry.get("order_id", "")
+                rec["real_bet"] = float(entry.get("filled_size", 0) or entry.get("size_usd", 0) or 0)
+                rec["real_fill_ratio"] = entry.get("fill_ratio")
+                raw = str(entry.get("raw_result", ""))
+                tx_start = raw.find("transactionsHashes")
+                if tx_start >= 0:
+                    rec["real_tx"] = raw[tx_start:]
+            elif etype == "order_no_fill" and rec["real_status"] != "matched":
+                rec["real_status"] = "no_fill"
+                rec["real_order_id"] = entry.get("order_id", "")
+            elif etype in ("order_error", "order_exception") and rec["real_status"] not in ("matched", "no_fill"):
+                rec["real_status"] = "error"
+                rec["real_order_id"] = entry.get("order_id", "")
+            elif etype == "safety_block" and rec["real_status"] == "not_attempted":
+                rec["real_status"] = "blocked"
+            elif etype == "trade_settled":
+                rec["real_pnl"] = entry.get("net_profit")
+                rec["real_outcome"] = entry.get("outcome", "")
+                rec["real_bet"] = float(entry.get("bet_amount", rec["real_bet"]) or 0)
+                rec["real_order_id"] = entry.get("order_id", rec["real_order_id"])
+
+    return by_slug
+
+
+def _merge_shadow_trades(trades: list[dict]) -> list[dict]:
+    """Collapse duplicate shadow ledger rows for the same market slug."""
+    merged: dict[str, dict] = {}
+    for trade in trades:
+        slug = trade.get("market_slug")
+        if not slug:
+            continue
+
+        current = merged.get(slug)
+        if not current:
+            merged[slug] = dict(trade)
+            continue
+
+        # Keep the latest timestamp as the base row.
+        if trade.get("timestamp", 0) >= current.get("timestamp", 0):
+            base = dict(trade)
+            other = current
+        else:
+            base = current
+            other = trade
+
+        for key in (
+            "actual_outcome", "exit_type", "order_id", "available_liquidity_usd",
+            "liquidity_adjusted", "original_size", "actual_size", "entry_source",
+        ):
+            if (not base.get(key)) and other.get(key):
+                base[key] = other.get(key)
+
+        # Prefer richer row values when duplicates exist.
+        if not base.get("actual_outcome") and other.get("actual_outcome"):
+            base["actual_outcome"] = other.get("actual_outcome")
+        if not base.get("bankroll_after") and other.get("bankroll_after") is not None:
+            base["bankroll_after"] = other.get("bankroll_after")
+
+        merged[slug] = base
+
+    return sorted(merged.values(), key=lambda t: t.get("timestamp", 0), reverse=True)
 
 
 # ── Dashboard ─────────────────────────────────────────────────
@@ -84,6 +183,32 @@ async def paper_trades(limit: int = 0):
     if limit > 0:
         return trades[:limit]
     return trades
+
+
+@app.get("/api/trade-history")
+async def reconciled_trade_history(limit: int = 200):
+    """Return one dashboard row per market enriched with real CLOB execution status."""
+    if not _trader:
+        return []
+
+    shadow_rows = _merge_shadow_trades(list(_trader.trades or []))
+    clob_map = _load_clob_trade_map()
+
+    rows = []
+    for trade in shadow_rows:
+        row = dict(trade)
+        real = clob_map.get(trade.get("market_slug", ""), {})
+        row["real_status"] = real.get("real_status", "not_attempted")
+        row["real_order_id"] = real.get("real_order_id", "")
+        row["real_bet"] = real.get("real_bet", 0.0)
+        row["real_pnl"] = real.get("real_pnl")
+        row["real_outcome"] = real.get("real_outcome", "")
+        row["real_fill_ratio"] = real.get("real_fill_ratio")
+        rows.append(row)
+
+    if limit > 0:
+        return rows[:limit]
+    return rows
 
 
 # ── Equity Curve ──────────────────────────────────────────────
@@ -425,15 +550,80 @@ async def health():
     }
 
 
+
+# ── V6 Strategy Stats ────────────────────────────────────────
+
+@app.get("/api/v6/strategy-stats")
+async def v6_strategy_stats():
+    """Return V6 strategy performance metrics."""
+    if not _trader:
+        return {"running": False, "message": "Trader not started"}
+
+    trades = _trader.trades
+    total = len(trades)
+    wins = sum(1 for t in trades if t.get("won"))
+    losses = total - wins
+
+    take_profits = sum(1 for t in trades if t.get("exit_type") == "take_profit")
+    stop_losses = sum(1 for t in trades if t.get("exit_type") == "stop_loss")
+    hedges = sum(1 for t in trades if t.get("exit_type") == "hedge")
+    held_to_resolution = total - take_profits - stop_losses - hedges
+
+    profits = [t.get("net_profit", 0) for t in trades]
+    avg_kelly = sum(t.get("bet_amount", 0) for t in trades) / max(total, 1)
+
+    # Max drawdown
+    peak = _trader._initial_bankroll if hasattr(_trader, '_initial_bankroll') else PAPER_INITIAL_BANKROLL
+    max_dd = 0
+    running = peak
+    for p in profits:
+        running += p
+        if running > peak:
+            peak = running
+        dd = peak - running
+        if dd > max_dd:
+            max_dd = dd
+
+    # Sharpe ratio (daily approx from per-trade returns)
+    import statistics
+    if len(profits) >= 2:
+        mean_r = statistics.mean(profits)
+        std_r = statistics.stdev(profits)
+        sharpe = (mean_r / std_r) * (252 ** 0.5) if std_r > 0 else 0
+    else:
+        sharpe = 0
+
+    return {
+        "version": VERSION,
+        "total_trades": total,
+        "wins": wins,
+        "losses": losses,
+        "take_profits": take_profits,
+        "stop_losses": stop_losses,
+        "hedges": hedges,
+        "held_to_resolution": held_to_resolution,
+        "avg_kelly_bet": round(avg_kelly, 2),
+        "max_drawdown": round(max_dd, 4),
+        "sharpe_ratio": round(sharpe, 4),
+        "win_rate": round(wins / max(total, 1) * 100, 2),
+        "bankroll": round(_trader.bankroll, 4),
+        "position_size_mode": POSITION_SIZE_MODE,
+        "kelly_fraction": KELLY_FRACTION,
+        "dynamic_exit": ENABLE_DYNAMIC_EXIT,
+        "take_profit_price": TAKE_PROFIT_PRICE,
+        "stop_loss_price": STOP_LOSS_PRICE,
+        "hedge_enabled": HEDGE_INSTEAD_OF_STOP,
+    }
+
 # ── Startup ──────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def on_startup():
     global _trader, _trader_task
-    logger.info(f"Starting V2.1 Frequency Optimized Paper Trader dashboard on port {DASHBOARD_PORT}")
+    logger.info(f"Starting V6 Kelly+Hedge Paper Trader dashboard on port {DASHBOARD_PORT}")
     _trader = FrequencyOptimizedTrader(bankroll=PAPER_INITIAL_BANKROLL)
     _trader_task = asyncio.create_task(_trader.run())
-    logger.info("V2.1 Paper Trader started")
+    logger.info("V6 Paper Trader started")
 
 
 if __name__ == "__main__":

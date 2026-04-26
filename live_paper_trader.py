@@ -44,10 +44,23 @@ from config import (
     CRYPTO_CONFIGS, ACTIVE_CRYPTOS, TRADING_MODE, SHADOW_TRADE_SIZE, MAX_TRADE_SIZE, MIN_TRADE_SIZE, TRADE_LOG, STATE_FILE,
     )
 from strategy import should_enter_staged, calculate_fee, calculate_payout
+from config import (
+    KELLY_FRACTION, MIN_BET_SIZE, POSITION_SIZE_MODE, FIXED_POSITION_SIZE,
+    ENABLE_DYNAMIC_EXIT, TAKE_PROFIT_PRICE, STOP_LOSS_PRICE,
+    POSITION_MONITOR_INTERVAL, HEDGE_INSTEAD_OF_STOP, MAX_HEDGE_TOTAL_COST,
+    POLY_CRYPTO_FEE_RATE as POLY_FEE_RATE_V6,
+    MIN_POSITION_AGE_FOR_EXIT, STOP_LOSS_CONSECUTIVE_SCANS,
+    MIN_EST_PROB, MAX_TIME_REMAINING_ENTRY,
+    MIN_DISTANCE_PCT, DEFAULT_MIN_DISTANCE_PCT,
+    KELLY_BOUNDARY_MULTIPLIER, KELLY_BOUNDARY_FRACTION,
+    NY_SESSION_START_UTC, NY_SESSION_END_UTC,
+    NY_MIN_ENTRY_PRICE, NY_KELLY_FRACTION, NY_MAX_TRADE_SIZE,
+    NY_SESSION_LOSS_LIMIT,
+)
 from trading_client import PolymarketTrader, append_jsonl
 from safety import SafetyManager
 
-logger = logging.getLogger("v21.trader")
+logger = logging.getLogger("v6.trader")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -67,6 +80,35 @@ def _extract_price_from_question(question: str) -> float | None:
         except ValueError:
             pass
     return None
+
+
+def _coerce_float(value) -> float | None:
+    """Best-effort float conversion for API metadata values."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = value.replace(",", "").strip()
+        if not cleaned:
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_jsonish(value):
+    """Decode JSON strings while leaving other types unchanged."""
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return json.loads(text)
+            except Exception:
+                return value
+    return value
 
 
 
@@ -253,6 +295,27 @@ class CLOBWebSocket:
     def get_best_bid(self, token_id: str) -> float | None:
         """Get cached best bid price for a token. None if no data."""
         return self.best_bids.get(token_id)
+
+    def get_best_bid_or_estimate(self, token_id: str, other_token_id: str = None) -> float | None:
+        """Get best bid for token. Falls back to estimating from opposite token's ask.
+        
+        For binary markets: bid(A) ≈ 1 - ask(B), minus a small spread adjustment.
+        This is needed because WS book events often don't include bid data.
+        """
+        # Try direct WS best_bid first
+        bid = self.best_bids.get(token_id)
+        if bid and bid > 0:
+            return bid
+        # Fallback: estimate from opposite token's best ask
+        if other_token_id:
+            other_ask = self.prices.get(other_token_id)
+            if other_ask and 0 < other_ask < 1:
+                # In binary market: bid(A) ≈ 1 - ask(B)
+                # Apply small spread discount (0.5 cents) to be conservative
+                estimated_bid = 1.0 - other_ask - 0.005
+                if estimated_bid > 0:
+                    return round(estimated_bid, 4)
+        return None
 
     def get_ask_liquidity(self, token_id: str) -> float:
         """Get total $ liquidity available on ask side. 0 if unknown."""
@@ -510,6 +573,9 @@ class FrequencyOptimizedTrader:
         self.params = {**DEFAULT_STRATEGY_PARAMS, **(params or {})}
         self.bankroll = bankroll
         self.initial_bankroll = bankroll
+        self._ny_session_pnl: float = 0.0
+        self._ny_session_date: str = ''
+        self._ny_session_halted: bool = False
         self.trades: list[dict] = []
         self.is_running = False
         self.mode = TRADING_MODE  # "paper", "shadow", "live"
@@ -541,6 +607,7 @@ class FrequencyOptimizedTrader:
         self.settled_slugs: set[str] = set()
         self._btc_price: float = 0.0                # backward compat
         self._crypto_prices: dict[str, float] = {}   # crypto_key -> price
+        self._minute_open_prices: dict[str, dict[int, float]] = {}  # crypto_key -> {minute_ts: open_price}
         self._last_btc_update: float = 0.0
         self.binance_feed: BinanceMultiFeed | None = None
         self._ws_eval_queue: asyncio.Queue | None = None  # token_id triggers
@@ -554,6 +621,8 @@ class FrequencyOptimizedTrader:
         self._ws_evals = 0
         self._rest_evals = 0
         self._started_at = 0
+        self._loop_heartbeats: dict[str, float] = {}
+        self._loop_restarts: dict[str, float] = {}
 
         self._load_trades()
         self._load_v21_state()
@@ -587,10 +656,55 @@ class FrequencyOptimizedTrader:
             except asyncio.QueueFull:
                 pass
 
+    def _beat(self, loop_name: str):
+        self._loop_heartbeats[loop_name] = time.time()
+
+    def _spawn_loop_recovery(self, loop_name: str):
+        now = time.time()
+        last_restart = self._loop_restarts.get(loop_name, 0)
+        if now - last_restart < 60:
+            return
+        self._loop_restarts[loop_name] = now
+        logger.warning("Watchdog restarting stalled loop: %s", loop_name)
+        if loop_name == "discovery":
+            asyncio.create_task(self._discovery_loop(), name=f"discovery-recovery-{int(now)}")
+        elif loop_name == "settlement":
+            asyncio.create_task(self._settlement_loop(), name=f"settlement-recovery-{int(now)}")
+        elif loop_name == "rest-eval":
+            asyncio.create_task(self._rest_evaluation_loop(), name=f"rest-eval-recovery-{int(now)}")
+        elif loop_name == "btc-price":
+            asyncio.create_task(self._btc_price_loop(), name=f"btc-price-recovery-{int(now)}")
+
+    async def _watchdog_loop(self):
+        """Restart critical loops if their heartbeats stop advancing."""
+        thresholds = {
+            "discovery": 120,
+            "settlement": 120,
+            "rest-eval": 120,
+            "btc-price": 15,
+        }
+        while self.is_running:
+            await asyncio.sleep(15)
+            if self._get_crypto_price("btc") <= 0:
+                continue
+            now = time.time()
+            for loop_name, threshold in thresholds.items():
+                last = self._loop_heartbeats.get(loop_name, 0)
+                if last and now - last > threshold:
+                    self._spawn_loop_recovery(loop_name)
+
 
     def _on_binance_price(self, crypto_key: str, price: float, ts_ms: int):
         """Called by BinanceMultiFeed on each price tick."""
         self._crypto_prices[crypto_key] = price
+        ts_sec = int(ts_ms / 1000)
+        minute_ts = ts_sec - (ts_sec % 60)
+        opens = self._minute_open_prices.setdefault(crypto_key, {})
+        opens.setdefault(minute_ts, price)
+        cutoff = minute_ts - 3600
+        stale_minutes = [m for m in opens if m < cutoff]
+        for m in stale_minutes:
+            del opens[m]
         # Feed rolling volatility calculator
         self.rolling_vol.add_price(crypto_key, price, time.time())
         if crypto_key == "btc":
@@ -600,6 +714,12 @@ class FrequencyOptimizedTrader:
     def _get_crypto_price(self, crypto_key: str) -> float:
         """Get current price for a crypto asset."""
         return self._crypto_prices.get(crypto_key, 0.0)
+
+    def _get_cached_minute_open(self, crypto_key: str, start_ts: int) -> float | None:
+        """Return cached Binance minute open captured from the live trade feed."""
+        if start_ts <= 0:
+            return None
+        return self._minute_open_prices.get(crypto_key, {}).get(start_ts)
 
     def _get_market_lock(self, slug: str) -> asyncio.Lock:
         """Get or create per-market lock to prevent double-entry race condition."""
@@ -703,13 +823,55 @@ class FrequencyOptimizedTrader:
             down = None
         return up, down
 
+    def _extract_price_to_beat_from_gamma(self, payload, crypto_key: str = "btc") -> float | None:
+        """Extract authoritative strike metadata from Gamma event/market payloads."""
+        cfg = CRYPTO_CONFIGS.get(crypto_key, CRYPTO_CONFIGS["btc"])
+        min_ptb = cfg.get("min_ptb", 1)
+        keys = {"pricetobeat", "price_to_beat", "strikeprice", "strike", "targetprice"}
+        stack = [_parse_jsonish(payload)]
+
+        while stack:
+            current = _parse_jsonish(stack.pop())
+            if isinstance(current, dict):
+                for key, value in current.items():
+                    key_norm = str(key).replace("-", "").replace("_", "").lower()
+                    if key_norm in keys:
+                        coerced = _coerce_float(value)
+                        if coerced and coerced > min_ptb:
+                            return coerced
+                    parsed_value = _parse_jsonish(value)
+                    if isinstance(parsed_value, (dict, list)):
+                        stack.append(parsed_value)
+            elif isinstance(current, list):
+                for item in current:
+                    parsed_item = _parse_jsonish(item)
+                    if isinstance(parsed_item, (dict, list)):
+                        stack.append(parsed_item)
+
+        return None
+
+    async def _fetch_gamma_event(self, client: httpx.AsyncClient, slug: str) -> dict | None:
+        """Fetch the Gamma event for a market slug."""
+        try:
+            resp = await client.get(f"{GAMMA_API}/events", params={"slug": slug})
+            resp.raise_for_status()
+            events = resp.json()
+            if not events or not isinstance(events, list):
+                return None
+            return events[0]
+        except Exception:
+            return None
+
     async def _get_price_to_beat(
         self, client: httpx.AsyncClient, slug: str,
         question: str = "", crypto_key: str = "btc",
-    ) -> float:
+        start_ts: int = 0,
+        market_details: dict | None = None,
+    ) -> tuple[float, str]:
         """Get the strike price for a crypto up/down market.
 
-        Priority: 1) Parse from question text, 2) REST API, 3) current price fallback.
+        Priority: 1) Question text, 2) REST API, 3) Gamma metadata,
+        4) Binance historical open. Never use live price as strike.
         """
         cfg = CRYPTO_CONFIGS.get(crypto_key, CRYPTO_CONFIGS["btc"])
         min_ptb = cfg.get("min_ptb", 1)
@@ -718,7 +880,7 @@ class FrequencyOptimizedTrader:
         if question:
             parsed = _extract_price_from_question(question)
             if parsed and parsed > min_ptb:
-                return parsed
+                return parsed, "question"
 
         # 2) Try REST endpoint
         try:
@@ -728,24 +890,53 @@ class FrequencyOptimizedTrader:
             resp.raise_for_status()
             ptb = float(resp.json().get("price", 0))
             if ptb > min_ptb:
-                return ptb
+                return ptb, "rest_api"
         except Exception:
             pass
 
-        # 3) Both sources failed — return 0 to signal "unknown strike".
-        # Previously fell back to current crypto price, which produced
-        # distance=0 and caused surprising near-zero-distance behaviour
-        # instead of a clean skip. Caller must handle 0 = unknown.
-        return 0
+        # 3) Try authoritative Gamma metadata if available.
+        gamma_ptb = None
+        if market_details:
+            gamma_ptb = _coerce_float(market_details.get("price_to_beat"))
+            if gamma_ptb and gamma_ptb > min_ptb:
+                return gamma_ptb, market_details.get("price_to_beat_source", "gamma_metadata")
+
+        if gamma_ptb is None:
+            event = await self._fetch_gamma_event(client, slug)
+            if event:
+                gamma_ptb = self._extract_price_to_beat_from_gamma(event, crypto_key)
+                if gamma_ptb and gamma_ptb > min_ptb:
+                    return gamma_ptb, "gamma_metadata"
+
+        # 4) For "Up or Down" markets, the strike is the Chainlink BTC/USD
+        #    price at the window OPEN. Prefer the cached minute-open from the
+        #    live Binance trade feed, then fall back to REST klines.
+        cached_open = self._get_cached_minute_open(crypto_key, start_ts)
+        if cached_open and cached_open > min_ptb:
+            logger.info(
+                f"  [{slug}] Using cached Binance minute open ${cached_open:,.2f} "
+                f"at ts={start_ts} as price_to_beat for {cfg['name']}"
+            )
+            return cached_open, "binance_minute_open"
+
+        if start_ts > 0:
+            hist = await self._get_historical_price(client, crypto_key, start_ts)
+            if hist and hist > min_ptb:
+                logger.info(
+                    f"  [{slug}] Using Binance historical open ${hist:,.2f} "
+                    f"at ts={start_ts} as price_to_beat for {cfg['name']}"
+                )
+                return hist, "binance_open"
+
+        # 5) All sources failed — return 0 to signal "unknown strike".
+        return 0, "unavailable"
 
     async def _check_resolution(self, client: httpx.AsyncClient, slug: str) -> str | None:
         try:
-            resp = await client.get(f"{GAMMA_API}/events", params={"slug": slug})
-            resp.raise_for_status()
-            events = resp.json()
-            if not events:
+            event = await self._fetch_gamma_event(client, slug)
+            if not event:
                 return None
-            markets = events[0].get("markets", [])
+            markets = event.get("markets", [])
             if not markets:
                 return None
             mkt = markets[0]
@@ -764,14 +955,9 @@ class FrequencyOptimizedTrader:
         """Fetch market details (token IDs, condition_id) from Gamma API."""
         fetch_start = time.time()
         try:
-            resp = await client.get(f"{GAMMA_API}/events", params={"slug": slug})
-            if resp.status_code != 200:
+            event = await self._fetch_gamma_event(client, slug)
+            if event is None:
                 return None
-            events = resp.json()
-            if not events or not isinstance(events, list):
-                return None
-
-            event = events[0]
             markets_list = event.get("markets", [])
             if not markets_list:
                 return None
@@ -794,11 +980,14 @@ class FrequencyOptimizedTrader:
             down_token = clob_tokens[down_idx] if len(clob_tokens) > down_idx else None
 
             fetch_ms = (time.time() - fetch_start) * 1000
+            price_to_beat = self._extract_price_to_beat_from_gamma(event, crypto_key="btc")
             return {
                 "question": mkt.get("question", event.get("title", "")),
                 "condition_id": mkt.get("conditionId", ""),
                 "up_token_id": up_token,
                 "down_token_id": down_token,
+                "price_to_beat": price_to_beat,
+                "price_to_beat_source": "gamma_metadata" if price_to_beat else "unknown",
                 "fetch_ms": fetch_ms,
             }
         except Exception as e:
@@ -853,9 +1042,12 @@ class FrequencyOptimizedTrader:
     async def run(self):
         self.is_running = True
         self._started_at = time.time()
+        self._initial_bankroll = self.bankroll  # V6: track for drawdown calc
         self._ws_eval_queue = asyncio.Queue(maxsize=1000)
 
-        logger.info(f"V2.1 Frequency-Optimized Trader starting | MODE={self.mode.upper()}")
+        logger.info(f"V6 Kelly+Hedge Trader starting | MODE={self.mode.upper()} | sizing={POSITION_SIZE_MODE} | exit={ENABLE_DYNAMIC_EXIT} | hedge={HEDGE_INSTEAD_OF_STOP}")
+        logger.info(f"  Exit guards: MIN_POSITION_AGE={MIN_POSITION_AGE_FOR_EXIT}s CONSECUTIVE_SCANS={STOP_LOSS_CONSECUTIVE_SCANS} SL={STOP_LOSS_PRICE} TP={TAKE_PROFIT_PRICE}")
+        logger.info(f"  Entry filters: MIN_EST_PROB={MIN_EST_PROB} MAX_TIME_REMAINING_ENTRY={MAX_TIME_REMAINING_ENTRY}s")
         logger.info(f"  Bankroll: ${self.bankroll:.2f}")
         logger.info(f"  Strategy: {self.params}")
         logger.info(f"  Staged entry: {STAGED_ENTRY}")
@@ -888,6 +1080,8 @@ class FrequencyOptimizedTrader:
             asyncio.create_task(self._status_loop(), name="status"),
             asyncio.create_task(self._daily_reset_loop(), name="daily-reset"),
             asyncio.create_task(self._redeem_loop(), name="auto-redeem"),
+            asyncio.create_task(self._position_monitor_loop(), name="position-monitor"),
+            asyncio.create_task(self._watchdog_loop(), name="watchdog"),
         ]
 
         try:
@@ -902,15 +1096,18 @@ class FrequencyOptimizedTrader:
 
     async def _discovery_loop(self):
         """Predictive discovery: compute upcoming slugs and pre-fetch."""
+        self._beat("discovery")
         # Wait for BTC price before starting discovery
         logger.info("Discovery waiting for price feeds...")
         while self.is_running and self._get_crypto_price("btc") <= 0:
             await asyncio.sleep(0.5)
+            self._beat("discovery")
         logger.info(f"Discovery started, BTC=${self._get_crypto_price('btc'):,.2f}")
         logger.info(f"Active cryptos: {ACTIVE_CRYPTOS}")
 
         async with httpx.AsyncClient(timeout=FETCH_TIMEOUT) as client:
             while self.is_running:
+                self._beat("discovery")
                 try:
                     now = int(time.time())
                     candidates = self.discovery.get_upcoming_slugs(now)
@@ -934,7 +1131,6 @@ class FrequencyOptimizedTrader:
                             # (don't add to prefetched so we'll retry next cycle)
                             continue
 
-                        self.discovery.mark_prefetched(slug)
                         disc_ms = (time.time() - disc_start) * 1000
                         self.discovery.record_discovery(disc_ms, cand["source"])
 
@@ -943,14 +1139,22 @@ class FrequencyOptimizedTrader:
                         cfg = CRYPTO_CONFIGS.get(crypto_key, CRYPTO_CONFIGS["btc"])
                         min_ptb = cfg.get("min_ptb", 1)
 
-                        ptb = await self._get_price_to_beat(
+                        ptb, ptb_source = await self._get_price_to_beat(
                             client, slug, question=details["question"],
                             crypto_key=crypto_key,
+                            start_ts=cand["start_ts"],
+                            market_details=details,
                         )
                         if ptb <= min_ptb:
-                            # Still couldn't get a valid price, skip
-                            logger.warning(f"  [{slug}] No valid price_to_beat for {cfg['name']}, skipping")
+                            # Do not mark as prefetched yet. For prefetch windows,
+                            # the market can exist before the opening strike is
+                            # available. Retrying next cycle lets us pick it up
+                            # once Gamma metadata or the Binance open becomes
+                            # available at/after the boundary.
+                            logger.warning(f"  [{slug}] No valid price_to_beat for {cfg['name']}, will retry")
                             continue
+
+                        self.discovery.mark_prefetched(slug)
 
                         # Register market
                         self.active_markets[slug] = {
@@ -964,6 +1168,7 @@ class FrequencyOptimizedTrader:
                             "up_token_id": details["up_token_id"],
                             "down_token_id": details["down_token_id"],
                             "price_to_beat": ptb,
+                            "price_to_beat_source": ptb_source,
                             "position": None,
                             "settled": False,
                             "settled_at": 0,
@@ -992,6 +1197,7 @@ class FrequencyOptimizedTrader:
                             f"ends in {remaining}s | target=${ptb:,.2f} | "
                             f"source={cand['source']} ({disc_ms:.0f}ms)"
                         )
+                        self._beat("discovery")
 
                 except Exception as e:
                     logger.error(f"Discovery error: {e}", exc_info=True)
@@ -1004,6 +1210,7 @@ class FrequencyOptimizedTrader:
         """Keep crypto prices fresh via Binance REST (fallback for WS)."""
         async with httpx.AsyncClient(timeout=FETCH_TIMEOUT) as client:
             while self.is_running:
+                self._beat("btc-price")
                 # Always fetch BTC first (backward compat)
                 await self._get_btc_price(client)
                 # Fetch other cryptos via REST as fallback
@@ -1031,6 +1238,7 @@ class FrequencyOptimizedTrader:
         """Evaluate strategy on each WS price update."""
         async with httpx.AsyncClient(timeout=FETCH_TIMEOUT) as client:
             while self.is_running:
+                self._beat("ws-eval")
                 try:
                     token_id = await asyncio.wait_for(
                         self._ws_eval_queue.get(), timeout=2
@@ -1041,6 +1249,7 @@ class FrequencyOptimizedTrader:
                         if not info["settled"] and info["position"] is None:
                             await self._evaluate_market(client, slug, info, source="ws")
                             self._ws_evals += 1
+                            self._beat("ws-eval")
                 except asyncio.TimeoutError:
                     continue
                 except Exception as e:
@@ -1052,6 +1261,7 @@ class FrequencyOptimizedTrader:
         """Periodic REST-based evaluation as fallback to WS."""
         async with httpx.AsyncClient(timeout=FETCH_TIMEOUT) as client:
             while self.is_running:
+                self._beat("rest-eval")
                 try:
                     now = int(time.time())
                     # At least one crypto must have a price
@@ -1078,6 +1288,7 @@ class FrequencyOptimizedTrader:
                         # REST fallback
                         await self._evaluate_market(client, slug, info, source="rest")
                         self._rest_evals += 1
+                        self._beat("rest-eval")
 
                 except Exception as e:
                     logger.error(f"REST eval error: {e}", exc_info=True)
@@ -1176,16 +1387,98 @@ class FrequencyOptimizedTrader:
             _ob_ask = self.clob_ws.get_price(_chosen_tok) or share_price
             logger.info(f"  [{slug}] Order book: best_bid={_ob_bid:.4f} best_ask={_ob_ask:.4f} spread={_ob_ask-_ob_bid:.4f}")
 
-            # Reject below-minimum entries (MIN_ENTRY_PRICE=0.80 filters coin-flip bets)
-            if share_price < MIN_ENTRY_PRICE:
-                logger.warning(f"  [{slug}] REJECTED price {share_price:.4f} < MIN_ENTRY_PRICE={MIN_ENTRY_PRICE}")
+            # V7 session-aware risk controls
+            import datetime as _dt
+            _utc_now = _dt.datetime.now(_dt.timezone.utc)
+            _utc_hour = _utc_now.hour
+            _today_str = _utc_now.strftime('%Y-%m-%d')
+            _is_ny = NY_SESSION_START_UTC <= _utc_hour < NY_SESSION_END_UTC
+            if self._ny_session_date != _today_str:
+                self._ny_session_pnl = 0.0
+                self._ny_session_halted = False
+                self._ny_session_date = _today_str
+            if _is_ny and self._ny_session_halted:
+                logger.info(f"  [{slug}] NY_HALTED: loss=${self._ny_session_pnl:.2f} today, skipping")
+                return
+            _eff_min_entry = NY_MIN_ENTRY_PRICE if _is_ny else MIN_ENTRY_PRICE
+            _eff_kelly_frac = NY_KELLY_FRACTION  if _is_ny else KELLY_FRACTION
+            _eff_max_trade  = NY_MAX_TRADE_SIZE  if _is_ny else MAX_TRADE_SIZE
+            if _is_ny:
+                logger.info(f"  [{slug}] NY_SESSION: entry>={_eff_min_entry} kelly={_eff_kelly_frac} max=${_eff_max_trade}")
+
+            # Reject below-minimum entries
+            if share_price < _eff_min_entry:
+                logger.warning(f"  [{slug}] REJECTED price {share_price:.4f} < {_eff_min_entry} ({'NY' if _is_ny else 'normal'})")
+                return
+
+            # ── V7 Per-crypto percentage distance filter ─────────────────────────
+            # Thresholds from 48h analysis of 3,442 markets across 6 cryptos
+            distance = abs(asset_price - info["price_to_beat"])
+            ptb = info["price_to_beat"]
+            crypto_symbol = crypto_key.upper()  # "btc" -> "BTC"
+            threshold_pct = MIN_DISTANCE_PCT.get(crypto_symbol, DEFAULT_MIN_DISTANCE_PCT)
+            distance_pct = (distance / ptb * 100) if ptb > 0 else 0.0
+            if distance_pct < threshold_pct:
+                tf_label = slug.split("-")[2] if slug.count("-") >= 2 else "?"
+                logger.info(
+                    f"  [{crypto_symbol} {tf_label}m] distance_check: "
+                    f"crypto={crypto_symbol}, price_to_beat=${ptb:.6g}, "
+                    f"current=${asset_price:.6g}, distance=${distance:.6g} ({distance_pct:.4f}%), "
+                    f"threshold={threshold_pct}%, REJECTED (below_min_distance_pct)"
+                )
+                try:
+                    import json as _json
+                    os.makedirs("logs_v7", exist_ok=True)
+                    with open(os.path.join("logs_v7", "distance_rejections.jsonl"), "a") as _rf:
+                        _rf.write(_json.dumps({
+                            "ts": int(time.time()), "crypto": crypto_symbol,
+                            "slug": slug, "distance_pct": round(distance_pct, 6),
+                            "threshold": threshold_pct, "current_price": asset_price,
+                            "price_to_beat": ptb, "distance_dollar": round(distance, 6),
+                        }) + "\n")
+                except Exception:
+                    pass
                 return
 
             # ── Dynamic trade sizing based on order book depth ──
             # Cap trade size to what can be filled cleanly within acceptable price.
             # Identical logic for paper and live — paper P&L matches live.
-            distance = abs(asset_price - info["price_to_beat"])
-            desired_size = min(self.bankroll * crypto_params["POSITION_SIZE"], MAX_TRADE_SIZE)
+            # distance already computed above
+
+            # ── V6 Kelly-based position sizing ──
+            if POSITION_SIZE_MODE == "kelly":
+                edge = est_prob - share_price
+                win_payout = 1.0 - share_price
+                if win_payout > 0:
+                    kelly = (est_prob * win_payout - (1 - est_prob) * share_price) / win_payout
+                else:
+                    kelly = 0.0
+                kelly = max(0.0, kelly)
+                # V7: Kelly boundary zone — use KELLY_BOUNDARY_FRACTION when near threshold
+                tf_label = slug.split("-")[2] if slug.count("-") >= 2 else "?"
+                if distance_pct < threshold_pct * KELLY_BOUNDARY_MULTIPLIER:
+                    kelly_mult = _eff_kelly_frac * KELLY_BOUNDARY_FRACTION
+                    kelly_zone = "boundary"
+                elif est_prob < 0.95:
+                    kelly_mult = _eff_kelly_frac * 0.5  # eighth-Kelly for lower conviction
+                    kelly_zone = "eighth"
+                else:
+                    kelly_mult = _eff_kelly_frac
+                    kelly_zone = "full"
+                logger.info(
+                    f"  [{crypto_symbol} {tf_label}m] distance_check: "
+                    f"crypto={crypto_symbol}, price_to_beat=${ptb:.6g}, "
+                    f"current=${asset_price:.6g}, distance=${distance:.6g} ({distance_pct:.4f}%), "
+                    f"threshold={threshold_pct}%, PASSED (kelly_zone={kelly_zone})"
+                )
+                desired_size = min(self.bankroll * kelly * kelly_mult, _eff_max_trade)
+                if desired_size < MIN_BET_SIZE:
+                    logger.info(f"  [{slug}] Kelly bet too small: kelly={kelly:.4f} -> ${desired_size:.2f}, skipping")
+                    return
+                kelly_label = kelly_zone
+                logger.info(f"  [{slug}] Kelly sizing ({kelly_label}): edge={edge:.4f} kelly={kelly:.4f} prob={est_prob:.4f} bet=${desired_size:.2f}")
+            else:
+                desired_size = min(self.bankroll * FIXED_POSITION_SIZE, _eff_max_trade)
 
             _chosen_token = info.get("up_token_id", "") if side == "Up" else info.get("down_token_id", "")
             max_acceptable_price = min(share_price + PRICE_BUFFER, 0.99)
@@ -1220,7 +1513,14 @@ class FrequencyOptimizedTrader:
                             if s > 0 and p <= max_acceptable_price:
                                 available_shares += s
                                 available_usd += p * s
-                        liq_source = "REST"
+                        if available_usd > 0:
+                            liq_source = "REST"
+                        else:
+                            # Book returned 200 but no asks at acceptable price
+                            # Fall back to desired_size (same as exception case)
+                            available_usd = desired_size
+                            liq_source = "book-empty-fallback"
+                            logger.info(f"  [{slug}] Book empty/no asks at <={max_acceptable_price:.2f}, using fallback (paper mode)")
                 except Exception as liq_err:
                     logger.warning(f"  [{slug}] Liquidity check failed ({liq_err}), using desired size")
                     available_usd = desired_size  # allow trade if check fails
@@ -1231,7 +1531,7 @@ class FrequencyOptimizedTrader:
             liquidity_adjusted = actual_size < desired_size
 
             if available_usd <= 0:
-                logger.info(f"  [{slug}] SKIP: no asks at <={max_acceptable_price:.2f} — would not fill")
+                logger.info(f"  [{slug}] SKIP: no asks at <={max_acceptable_price:.2f} — would not fill (liq_source={liq_source})")
                 return
 
             if actual_size < MIN_TRADE_SIZE:
@@ -1270,6 +1570,8 @@ class FrequencyOptimizedTrader:
                 "side": side,
                 "entry_price": simulated_price,
                 "raw_market_price": share_price,  # actual market price before slippage
+                "token_id": info["up_token_id"] if side == "Up" else info["down_token_id"],
+                "other_token_id": info["down_token_id"] if side == "Up" else info["up_token_id"],
                 "estimated_prob": est_prob,
                 "bet_amount": bet_amount,
                 "shares": shares,
@@ -1316,6 +1618,360 @@ class FrequencyOptimizedTrader:
                 f"Up={up_price:.3f} Dn={down_price:.3f} | skip ({source})"
             )
 
+
+
+    # ── V6 REST book fetch for position monitor ──
+
+    async def _get_book_prices_rest(self, token_id: str) -> tuple[float, float]:
+        """Fetch best bid and best ask from CLOB REST API.
+        Returns (best_bid, best_ask). Either can be 0 if unavailable."""
+        try:
+            async with httpx.AsyncClient(timeout=3) as client:
+                resp = await client.get(
+                    f"{CLOB_API}/book",
+                    params={"token_id": token_id},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    bids = data.get("bids", [])
+                    asks = data.get("asks", [])
+                    best_bid = 0.0
+                    best_ask = 0.0
+                    if bids:
+                        best_bid = max(
+                            (float(b.get("price", 0)) for b in bids if float(b.get("size", 0)) > 0),
+                            default=0.0
+                        )
+                    if asks:
+                        valid_asks = [float(a.get("price", 999)) for a in asks if float(a.get("size", 0)) > 0]
+                        best_ask = min(valid_asks) if valid_asks else 0.0
+                    return best_bid, best_ask
+        except Exception as e:
+            logger.debug("REST book fetch failed for %s: %s", token_id[:20], e)
+        return 0.0, 0.0
+
+    # ── V6 Position Monitor (take-profit / stop-loss / hedge) ──
+
+    async def _position_monitor_loop(self):
+        """Monitor open positions for take-profit and stop-loss exits."""
+        if not ENABLE_DYNAMIC_EXIT:
+            logger.info("Dynamic exit disabled, position monitor not running")
+            return
+        logger.info("Position monitor started (TP=%.2f, SL=%.2f, hedge=%s, interval=%ds)",
+                     TAKE_PROFIT_PRICE, STOP_LOSS_PRICE, HEDGE_INSTEAD_OF_STOP,
+                     POSITION_MONITOR_INTERVAL)
+        heartbeat_counter = 0
+        while self.is_running:
+            self._beat("position-monitor")
+            try:
+                heartbeat_counter += 1
+                checked = 0
+                no_token = 0
+                no_bid = 0
+                in_range = 0
+
+                for slug, info in list(self.active_markets.items()):
+                    pos = info.get("position")
+                    if pos is None or pos.get("exited"):
+                        continue
+
+                    # Get current best bid for our token (what we'd sell at)
+                    token_id = pos.get("token_id")
+                    other_token_id = pos.get("other_token_id")
+                    if not token_id:
+                        no_token += 1
+                        continue
+
+                    checked += 1
+
+                    # -- Age guard: skip ALL exit checks if position too young --
+                    entry_time = pos.get("entry_time", 0)
+                    position_age = time.time() - entry_time if entry_time else 9999
+                    if position_age < MIN_POSITION_AGE_FOR_EXIT:
+                        in_range += 1  # count as in range for heartbeat
+                        continue
+
+                    # Use the new fallback method that estimates from opposite ask
+                    best_bid = self.clob_ws.get_best_bid_or_estimate(token_id, other_token_id)
+                    bid_source = "ws" if best_bid else None
+                    
+                    # REST fallback: fetch from CLOB API if WS has no data
+                    if best_bid is None or best_bid <= 0:
+                        rest_bid, rest_ask = await self._get_book_prices_rest(token_id)
+                        if rest_bid > 0:
+                            best_bid = rest_bid
+                            bid_source = "rest"
+                        elif other_token_id:
+                            # Try opposite token REST for estimation
+                            _, other_rest_ask = await self._get_book_prices_rest(other_token_id)
+                            if other_rest_ask and 0 < other_rest_ask < 1:
+                                best_bid = round(1.0 - other_rest_ask - 0.005, 4)
+                                bid_source = "rest-est"
+
+                    if best_bid is None or best_bid <= 0:
+                        no_bid += 1
+                        continue
+
+                    entry_price = pos["entry_price"]
+                    shares = pos["shares"]
+                    bet_amount = pos.get("bet_amount", 0)
+                    if shares <= 0:
+                        continue
+
+                    # ── Take profit ──
+                    if best_bid >= TAKE_PROFIT_PRICE:
+                        revenue = shares * best_bid
+                        sell_fee = shares * POLY_CRYPTO_FEE_RATE * best_bid * (1 - best_bid)
+                        net_profit = revenue - bet_amount - sell_fee
+
+                        self.bankroll += net_profit  # net_profit already includes -bet_amount
+                        pos["exited"] = True
+                        pos["exit_type"] = "take_profit"
+                        pos["exit_price"] = best_bid
+                        pos["exit_profit"] = net_profit
+                        logger.info(
+                            "  [%s] TAKE PROFIT: entry=$%.4f bid=$%.4f shares=%.2f "
+                            "revenue=$%.4f fee=$%.4f net=$%.4f",
+                            slug, entry_price, best_bid, shares,
+                            revenue, sell_fee, net_profit
+                        )
+                        self._log_exit(slug, pos, "take_profit", best_bid, net_profit)
+                        await self._finalize_live_position_exit(
+                            slug, pos, info.get("crypto_key", "btc"), best_bid, "take_profit"
+                        )
+                        continue
+
+                    # ── Stop loss / Hedge (consecutive scan requirement) ──
+                    if best_bid <= STOP_LOSS_PRICE:
+                        pos["consecutive_low_scans"] = pos.get("consecutive_low_scans", 0) + 1
+                        if pos["consecutive_low_scans"] < STOP_LOSS_CONSECUTIVE_SCANS:
+                            logger.info("  [%s] Low bid $%.3f (scan %d/%d, waiting for confirmation)",
+                                        slug, best_bid, pos["consecutive_low_scans"], STOP_LOSS_CONSECUTIVE_SCANS)
+                            in_range += 1
+                            continue
+                        # 3 consecutive scans below threshold — trigger exit
+                        if HEDGE_INSTEAD_OF_STOP:
+                            # Try to hedge by buying opposite side
+                            if other_token_id:
+                                other_ask = self.clob_ws.get_price(other_token_id)  # best ask
+                                if not other_ask or other_ask <= 0:
+                                    # REST fallback for opposite token ask
+                                    _, rest_other_ask = await self._get_book_prices_rest(other_token_id)
+                                    if rest_other_ask > 0:
+                                        other_ask = rest_other_ask
+                                if other_ask and other_ask > 0:
+                                    total_cost = entry_price + other_ask
+                                    if total_cost <= MAX_HEDGE_TOTAL_COST:
+                                        # Hedge: buy opposite side
+                                        hedge_bet = shares * other_ask
+                                        hedge_fee = shares * POLY_CRYPTO_FEE_RATE * other_ask * (1 - other_ask)
+                                        guaranteed_loss = (total_cost - 1.0) * shares + hedge_fee
+                                        self.bankroll -= (hedge_bet + hedge_fee)  # pay for hedge
+                                        pos["exited"] = True
+                                        pos["exit_type"] = "hedge"
+                                        pos["hedge_price"] = other_ask
+                                        pos["hedge_total_cost"] = total_cost
+                                        pos["max_loss"] = guaranteed_loss
+                                        pos["exit_profit"] = -guaranteed_loss
+                                        logger.info(
+                                            "  [%s] HEDGE: entry=$%.4f + opposite@$%.4f = $%.4f/share | "
+                                            "hedge_cost=$%.4f fee=$%.4f | max_loss=$%.4f "
+                                            "(unhedged would be $%.2f)",
+                                            slug, entry_price, other_ask, total_cost,
+                                            hedge_bet, hedge_fee, guaranteed_loss, bet_amount
+                                        )
+                                        self._log_exit(slug, pos, "hedge", other_ask, -guaranteed_loss)
+                                        await self._finalize_live_position_exit(
+                                            slug, pos, info.get("crypto_key", "btc"), other_ask, "hedge"
+                                        )
+                                        continue
+                            # If hedge not possible, fall through to regular stop-loss
+
+                        # Regular stop-loss: sell at current bid
+                        revenue = shares * best_bid
+                        sell_fee = shares * POLY_CRYPTO_FEE_RATE * best_bid * (1 - best_bid)
+                        net_loss = revenue - bet_amount - sell_fee
+
+                        self.bankroll += net_loss  # net_loss already includes -bet_amount
+                        pos["exited"] = True
+                        pos["exit_type"] = "stop_loss"
+                        pos["exit_price"] = best_bid
+                        pos["exit_profit"] = net_loss
+                        logger.info(
+                            "  [%s] STOP LOSS: entry=$%.4f bid=$%.4f shares=%.2f "
+                            "revenue=$%.4f fee=$%.4f net=$%.4f",
+                            slug, entry_price, best_bid, shares,
+                            revenue, sell_fee, net_loss
+                        )
+                        self._log_exit(slug, pos, "stop_loss", best_bid, net_loss)
+                        await self._finalize_live_position_exit(
+                            slug, pos, info.get("crypto_key", "btc"), best_bid, "stop_loss"
+                        )
+                        continue
+
+                    # Position checked but between SL and TP thresholds — reset consecutive counter
+                    pos["consecutive_low_scans"] = 0
+                    in_range += 1
+
+                # Heartbeat every 30 cycles (~60 seconds)
+                if heartbeat_counter % 30 == 0 and (checked > 0 or no_bid > 0 or no_token > 0):
+                    ws_bids = len(self.clob_ws.best_bids)
+                    ws_asks = len(self.clob_ws.prices)
+                    logger.info(
+                        "Position monitor heartbeat: checked=%d no_token=%d no_bid=%d in_range=%d "
+                        "| WS bids=%d asks=%d",
+                        checked, no_token, no_bid, in_range, ws_bids, ws_asks
+                    )
+                    # Sample one position's bid for debugging
+                    if checked > 0:
+                        for slug, info in list(self.active_markets.items()):
+                            pos = info.get("position")
+                            if pos and not pos.get("exited") and pos.get("token_id"):
+                                tid = pos["token_id"]
+                                oid = pos.get("other_token_id", "")
+                                ws_bid = self.clob_ws.best_bids.get(tid)
+                                ws_ask = self.clob_ws.prices.get(tid)
+                                other_ask = self.clob_ws.prices.get(oid) if oid else None
+                                est_bid = (1.0 - other_ask - 0.005) if other_ask and 0 < other_ask < 1 else None
+                                logger.info(
+                                    "  Monitor sample [%s]: ws_bid=%s ws_ask=%s other_ask=%s est_bid=%s entry=%.3f (REST fallback active)",
+                                    slug[:30],
+                                    f"${ws_bid:.3f}" if ws_bid else "None",
+                                    f"${ws_ask:.3f}" if ws_ask else "None",
+                                    f"${other_ask:.3f}" if other_ask else "None",
+                                    f"${est_bid:.3f}" if est_bid else "None",
+                                    pos["entry_price"]
+                                )
+                                break
+
+            except Exception as e:
+                logger.error("Position monitor error: %s", e, exc_info=True)
+
+            now_cleanup = time.time()
+            stale = [
+                s for s in list(self._live_positions.keys())
+                if s not in self.active_markets
+                or self.active_markets.get(s, {}).get("settled")
+                or self.active_markets.get(s, {}).get("end_ts", 0) + 300 < now_cleanup
+            ]
+            for s in stale:
+                del self._live_positions[s]
+                self.safety.current_positions = max(0, self.safety.current_positions - 1)
+                logger.warning(
+                    "STALE CLEANUP: removed %s from live_positions, safety count now=%d",
+                    s, self.safety.current_positions
+                )
+            if stale:
+                self.safety._save_state()
+                self._save_v21_state()
+
+            await asyncio.sleep(POSITION_MONITOR_INTERVAL)
+
+    def _get_live_fill_details(self, slug: str, fallback_entry_price: float) -> tuple[dict | None, dict, float, float]:
+        """Return live position, order result, real bet, and filled shares for shadow/live trades."""
+        live_pos = self._live_positions.get(slug)
+        if not live_pos:
+            return None, {}, 0.0, 0.0
+
+        order_result = live_pos.get("order_result", {})
+        real_bet = float(live_pos.get("trade_size_usd", 0) or 0)
+        real_shares = float(order_result.get("taking_amount", 0) or 0)
+        if real_shares <= 0:
+            raw = str(order_result.get("raw_result", ""))
+            taking_match = re.search(r"'takingAmount':\s*'([\d.]+)'", raw)
+            real_shares = (
+                float(taking_match.group(1)) if taking_match
+                else (real_bet / fallback_entry_price if fallback_entry_price > 0 else 0.0)
+            )
+        return live_pos, order_result, real_bet, real_shares
+
+    async def _finalize_live_position_exit(self, slug: str, pos: dict, crypto_key: str,
+                                           exit_price: float, exit_type: str):
+        """Immediately clear shadow/live position state when an early exit occurs."""
+        if self.mode == "paper":
+            return
+
+        live_pos, order_result, real_bet, real_shares = self._get_live_fill_details(
+            slug, pos.get("entry_price", 0)
+        )
+        if not live_pos:
+            return
+
+        if exit_type == "hedge":
+            hedge_cost = real_shares * exit_price
+            hedge_fee = real_shares * POLY_CRYPTO_FEE_RATE * exit_price * (1 - exit_price)
+            payout = real_shares
+            actual_pnl = payout - real_bet - hedge_cost - hedge_fee
+            won = False
+        else:
+            payout = real_shares * exit_price
+            exit_fee = real_shares * POLY_CRYPTO_FEE_RATE * exit_price * (1 - exit_price)
+            actual_pnl = payout - real_bet - exit_fee
+            won = actual_pnl > 0
+
+        await self.safety.record_result(won, actual_pnl)
+        self.real_pnl_total += actual_pnl
+        self.real_trade_count += 1
+        append_jsonl(TRADE_LOG, {
+            "timestamp": time.time(),
+            "type": "trade_settled",
+            "market_slug": slug,
+            "crypto_key": crypto_key,
+            "side": pos.get("side", ""),
+            "outcome": "",
+            "won": won,
+            "bet_amount": real_bet,
+            "payout": round(payout, 6),
+            "net_profit": round(actual_pnl, 6),
+            "real_pnl_total": round(self.real_pnl_total, 6),
+            "order_id": order_result.get("order_id", ""),
+            "exit_type": exit_type,
+            "exit_price": round(exit_price, 6),
+        })
+        del self._live_positions[slug]
+        self._save_v21_state()
+        logger.info("  [%s] Live position cleaned up (%s)", slug, exit_type)
+
+    def _log_exit(self, slug: str, pos: dict, exit_type: str, exit_price: float, net_profit: float):
+        """Log an early exit (take-profit, stop-loss, or hedge) to trades file."""
+        trade = {
+            "market_slug": slug,
+            "side": pos["side"],
+            "actual_outcome": "",
+            "entry_price": round(pos["entry_price"], 4),
+            "exit_price": round(exit_price, 4),
+            "exit_type": exit_type,
+            "estimated_prob": round(pos.get("estimated_prob", 0), 4),
+            "won": exit_type == "take_profit",
+            "bet_amount": round(pos["bet_amount"], 4),
+            "shares": round(pos["shares"], 4),
+            "net_profit": round(net_profit, 4),
+            "bankroll_after": round(self.bankroll, 4),
+            "time_remaining": pos.get("time_remaining", 0),
+            "crypto_key": pos.get("crypto_key", "btc"),
+            "crypto_name": pos.get("crypto_name", "Bitcoin"),
+            "asset_price": round(pos.get("asset_price", 0), 6),
+            "timestamp": int(time.time()),
+            "entry_source": pos.get("entry_source", "unknown"),
+            "mode": pos.get("mode", self.mode),
+        }
+        if exit_type == "hedge":
+            trade["hedge_price"] = round(pos.get("hedge_price", 0), 4)
+            trade["hedge_total_cost"] = round(pos.get("hedge_total_cost", 0), 4)
+            trade["max_loss"] = round(pos.get("max_loss", 0), 4)
+        # V7: NY session P&L tracking
+        import datetime as _dtx
+        _hx = _dtx.datetime.now(_dtx.timezone.utc).hour
+        _dx = _dtx.datetime.now(_dtx.timezone.utc).strftime('%Y-%m-%d')
+        if self._ny_session_date != _dx:
+            self._ny_session_pnl = 0.0; self._ny_session_halted = False; self._ny_session_date = _dx
+        if NY_SESSION_START_UTC <= _hx < NY_SESSION_END_UTC:
+            self._ny_session_pnl += trade.get('net_profit', 0.0)
+            if self._ny_session_pnl <= NY_SESSION_LOSS_LIMIT and not self._ny_session_halted:
+                self._ny_session_halted = True
+                logger.warning(f'NY_SESSION_HALT: pnl=${self._ny_session_pnl:.2f}')
+        self.trades.append(trade)
+        self._save_trade(trade)
 
     # ── Real Trade Execution (shadow/live mode) ───────────────
 
@@ -1498,6 +2154,7 @@ class FrequencyOptimizedTrader:
         """Check and settle expired markets."""
         async with httpx.AsyncClient(timeout=FETCH_TIMEOUT) as client:
             while self.is_running:
+                self._beat("settlement")
                 try:
                     now = int(time.time())
                     for slug, info in list(self.active_markets.items()):
@@ -1528,10 +2185,39 @@ class FrequencyOptimizedTrader:
         asset_price = self._get_crypto_price(crypto_key)
 
         outcome = await self._check_resolution(client, slug)
+        trusted_ptb_sources = {"question", "rest_api", "gamma_metadata"}
 
         if outcome is None:
             if expired_for < 35:
                 return  # Retry next cycle
+            if info.get("price_to_beat_source") not in trusted_ptb_sources:
+                refreshed_ptb, refreshed_source = await self._get_price_to_beat(
+                    client,
+                    slug,
+                    question=info.get("question", ""),
+                    crypto_key=crypto_key,
+                    start_ts=info["start_ts"],
+                )
+                if refreshed_ptb > cfg.get("min_ptb", 1):
+                    if (
+                        refreshed_source != info.get("price_to_beat_source")
+                        or abs(refreshed_ptb - info["price_to_beat"]) > 1e-9
+                    ):
+                        logger.info(
+                            f"  [{cfg['name']}] {slug} → refreshed strike ${refreshed_ptb:,.6g} "
+                            f"from {refreshed_source} (was ${info['price_to_beat']:,.6g} from "
+                            f"{info.get('price_to_beat_source', 'unknown')})"
+                        )
+                    info["price_to_beat"] = refreshed_ptb
+                    info["price_to_beat_source"] = refreshed_source
+
+            if info.get("price_to_beat_source") not in trusted_ptb_sources:
+                logger.warning(
+                    f"  [{cfg['name']}] {slug} → waiting for authoritative strike; "
+                    f"current source={info.get('price_to_beat_source', 'unknown')}"
+                )
+                return
+
             # Prefer historical price AT market close over current live price.
             # For 5m markets especially, 35+ seconds of drift between end_ts and
             # "now" can flip the inferred outcome vs what Polymarket will
@@ -1591,6 +2277,82 @@ class FrequencyOptimizedTrader:
 
         # Calculate P&L
         pos = info["position"]
+
+        # ── V6: Handle positions already exited via take-profit/stop-loss/hedge ──
+        if pos.get("exited"):
+            exit_type = pos.get("exit_type", "unknown")
+            if exit_type == "hedge":
+                # Hedge settlement: we own both YES and NO → guaranteed $1.00/share payout
+                payout = pos["shares"] * 1.0
+                self.bankroll += payout - pos["bet_amount"]  # payout minus original bet (never deducted at entry)
+                net = -pos.get("max_loss", 0)
+                logger.info(
+                    f"  [{cfg['name']}] {slug}: HEDGE settled | payout=${payout:.4f} | "
+                    f"net=${net:.4f} (max_loss=${pos.get('max_loss', 0):.4f})"
+                )
+            else:
+                net = pos.get("exit_profit", 0)
+                logger.info(
+                    f"  [{cfg['name']}] {slug}: already exited via {exit_type} | "
+                    f"recorded P&L=${net:.4f}"
+                )
+            # Update trade record with actual outcome (was "" at exit time)
+            for t in reversed(self.trades):
+                if t.get("market_slug") == slug and t.get("exit_type"):
+                    t["actual_outcome"] = outcome
+                    break
+            # Persist updated trades to file so outcome survives restarts
+            self._rewrite_trades_file()
+
+            # Log perf data
+            perf_data["actual_entry_price"] = pos["entry_price"]
+            perf_data["entry_delay_ms"] = pos.get("entry_delay_ms", 0)
+            perf_data["won"] = net > 0
+            perf_data["net_profit"] = net
+            perf_data["exit_type"] = exit_type
+            perf_data["missed_reason"] = None
+            self.perf.log_window(perf_data)
+
+            # If a real shadow/live order was placed for this market, settlement still
+            # needs to clear the live position and update safety counters even though
+            # the paper position exited earlier via TP/SL/hedge.
+            if self.mode != "paper" and slug in self._live_positions:
+                live_pos = self._live_positions[slug]
+                order_result = live_pos.get("order_result", {})
+                real_bet = live_pos.get("trade_size_usd", 0)
+                real_shares = float(order_result.get("taking_amount", 0) or 0)
+                if real_shares <= 0:
+                    raw = str(order_result.get("raw_result", ""))
+                    taking_match = re.search(r"'takingAmount':\s*'([\d.]+)'", raw)
+                    real_shares = (
+                        float(taking_match.group(1)) if taking_match
+                        else (real_bet / pos["entry_price"] if pos["entry_price"] > 0 else 0)
+                    )
+                won_real = pos["side"] == outcome
+                real_payout = real_shares * 1.0 if won_real else 0.0
+                actual_pnl = real_payout - real_bet
+
+                await self.safety.record_result(won_real, actual_pnl)
+                self.real_pnl_total += actual_pnl
+                self.real_trade_count += 1
+                append_jsonl(TRADE_LOG, {
+                    "timestamp": time.time(),
+                    "type": "trade_settled",
+                    "market_slug": slug,
+                    "crypto_key": crypto_key,
+                    "side": pos["side"],
+                    "outcome": outcome,
+                    "won": won_real,
+                    "bet_amount": real_bet,
+                    "payout": real_payout,
+                    "net_profit": round(actual_pnl, 6),
+                    "real_pnl_total": round(self.real_pnl_total, 6),
+                    "order_id": order_result.get("order_id", ""),
+                })
+                del self._live_positions[slug]
+                self._save_v21_state()
+            return
+
         won = pos["side"] == outcome
 
         # Check if we have a real CLOB trade for this market
@@ -1652,6 +2414,17 @@ class FrequencyOptimizedTrader:
             "original_size": pos.get("original_size", 0),
             "actual_size": pos.get("actual_size", 0),
         }
+        # V7: NY session P&L tracking
+        import datetime as _dty
+        _hy = _dty.datetime.now(_dty.timezone.utc).hour
+        _dy = _dty.datetime.now(_dty.timezone.utc).strftime('%Y-%m-%d')
+        if self._ny_session_date != _dy:
+            self._ny_session_pnl = 0.0; self._ny_session_halted = False; self._ny_session_date = _dy
+        if NY_SESSION_START_UTC <= _hy < NY_SESSION_END_UTC:
+            self._ny_session_pnl += trade.get('net_profit', 0.0)
+            if self._ny_session_pnl <= NY_SESSION_LOSS_LIMIT and not self._ny_session_halted:
+                self._ny_session_halted = True
+                logger.warning(f'NY_SESSION_HALT: pnl=${self._ny_session_pnl:.2f}')
         self.trades.append(trade)
         self._save_trade(trade)
 
