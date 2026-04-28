@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,6 +27,11 @@ from pathlib import Path
 import httpx
 
 from redeem import run_redeem_cycle, get_redeem_status
+
+try:
+    import fcntl  # POSIX-only; trader runs on Linux VM
+except ImportError:
+    fcntl = None
 
 try:
     import websockets
@@ -39,7 +45,7 @@ from config import (
     LOGS_DIR, PAPER_TRADES_FILE, PERFORMANCE_LOG_FILE,
     PREDICTIVE_PREFETCH_SECS, PREDICTIVE_CHECK_INTERVAL,
     STAGED_ENTRY, MIN_ENTRY_PRICE, VERSION, PRICE_BUFFER,
-    WS_CLOB_URL, WS_RECONNECT_DELAY, WS_FALLBACK_POLL_INTERVAL,
+    WS_CLOB_URL, WS_RECONNECT_DELAY, WS_FALLBACK_POLL_INTERVAL, POLYMARKET_WS,
     SLUG_DURATION_MAP,
     CRYPTO_CONFIGS, ACTIVE_CRYPTOS, TRADING_MODE, SHADOW_TRADE_SIZE, MAX_TRADE_SIZE, MIN_TRADE_SIZE, TRADE_LOG, STATE_FILE,
     )
@@ -56,6 +62,8 @@ from config import (
     NY_SESSION_START_UTC, NY_SESSION_END_UTC,
     NY_MIN_ENTRY_PRICE, NY_KELLY_FRACTION, NY_MAX_TRADE_SIZE,
     NY_SESSION_LOSS_LIMIT,
+    TRUSTED_PTB_SOURCES, STRIKE_GATE_MODE,
+    STRIKE_GATE_SIZE_FACTOR, STRIKE_GATE_MIN_EDGE_BUMP,
 )
 from trading_client import PolymarketTrader, append_jsonl
 from safety import SafetyManager
@@ -109,6 +117,53 @@ def _parse_jsonish(value):
             except Exception:
                 return value
     return value
+
+
+def _acquire_singleton_lock(mode: str) -> "object | None":
+    """Acquire an exclusive flock on data/trader_<mode>.lock.
+
+    The bot is configured to talk to a single Polymarket wallet. Two
+    concurrent processes (e.g. live_paper_trader.py and dashboard.py) each
+    instantiating FrequencyOptimizedTrader will independently submit
+    orders, producing the duplicate trades seen on 2026-04-28. The lock
+    survives only as long as the holding process; if the previous owner
+    dies the kernel releases it automatically.
+
+    Returns the open file handle (must be kept alive) or exits the
+    process if another instance already holds the lock.
+    """
+    if fcntl is None:
+        # Non-POSIX (dev box on Windows). Skip the check rather than crash.
+        return None
+    from config import DATA_DIR
+    os.makedirs(DATA_DIR, exist_ok=True)
+    lock_path = os.path.join(DATA_DIR, f"trader_{mode}.lock")
+    # Open without truncating so we can read the holder's PID on failure.
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    fh = os.fdopen(fd, "r+")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        try:
+            fh.seek(0)
+            existing = fh.read().strip() or "?"
+        except Exception:
+            existing = "?"
+        fh.close()
+        logger.critical(
+            "Another trader instance (mode=%s) already holds %s (pid=%s). "
+            "Refusing to start — this prevents duplicate orders on the same "
+            "wallet. Stop the other instance first.",
+            mode, lock_path, existing,
+        )
+        sys.exit(1)
+    # We hold the lock — overwrite with our PID.
+    fh.seek(0)
+    fh.truncate()
+    fh.write(str(os.getpid()))
+    fh.flush()
+    logger.info("Singleton lock acquired: %s (pid=%d)", lock_path, os.getpid())
+    return fh
 
 
 
@@ -168,6 +223,111 @@ class BinanceMultiFeed:
                 self._connected = False
                 logger.warning("[Binance Multi WS] Disconnected: %s, reconnecting in 2s...", e)
                 await asyncio.sleep(2)
+
+    def get_price(self, crypto_key: str) -> float:
+        return self.latest_prices.get(crypto_key, 0.0)
+
+    def age_ms(self, crypto_key: str) -> float:
+        ts = self.latest_timestamps.get(crypto_key)
+        if ts is None:
+            return 99999
+        return time.time() * 1000 - ts
+
+
+class ChainlinkPriceFeed:
+    """Polymarket RTDS WebSocket feed for Chainlink crypto prices."""
+
+    PING_INTERVAL = 20
+
+    def __init__(self, crypto_keys: list[str], on_price_callback):
+        self.url = POLYMARKET_WS
+        self.on_price = on_price_callback
+        self._connected = False
+        self._msg_count = 0
+        self.latest_prices: dict[str, float] = {}
+        self.latest_timestamps: dict[str, int] = {}
+        self._symbol_to_key: dict[str, str] = {}
+
+        for key in crypto_keys:
+            symbol = str(CRYPTO_CONFIGS[key].get("chainlink_ws_symbol", "")).lower()
+            if symbol:
+                self._symbol_to_key[symbol] = key
+
+    async def connect(self):
+        if websockets is None:
+            logger.error("websockets not installed — ChainlinkPriceFeed disabled")
+            return
+        while True:
+            try:
+                async with websockets.connect(
+                    self.url,
+                    additional_headers={
+                        "Origin": "https://polymarket.com",
+                        "User-Agent": "Mozilla/5.0",
+                    },
+                ) as ws:
+                    self._connected = True
+                    logger.info("[Chainlink RTDS] Connected")
+                    await ws.send(json.dumps({
+                        "action": "subscribe",
+                        "subscriptions": [{
+                            "topic": "crypto_prices_chainlink",
+                            "type": "*",
+                            "filters": "",
+                        }],
+                    }))
+                    logger.info("[Chainlink RTDS] Subscribed to crypto_prices_chainlink")
+
+                    last_ping = time.time()
+                    while True:
+                        now = time.time()
+                        if now - last_ping >= self.PING_INTERVAL:
+                            await ws.send("PING")
+                            last_ping = now
+
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                        except asyncio.TimeoutError:
+                            continue
+
+                        if isinstance(raw, bytes) or raw in ("PONG", "pong", ""):
+                            continue
+
+                        try:
+                            msg = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+
+                        if msg.get("topic") != "crypto_prices_chainlink":
+                            continue
+
+                        payload = msg.get("payload", {})
+                        if not isinstance(payload, dict):
+                            continue
+
+                        symbol = str(payload.get("symbol", "")).lower()
+                        crypto_key = self._symbol_to_key.get(symbol)
+                        if crypto_key is None:
+                            continue
+
+                        value = payload.get("value")
+                        if value is None:
+                            continue
+
+                        ts = int(payload.get("timestamp", int(time.time() * 1000)))
+                        price = float(value)
+                        self.latest_prices[crypto_key] = price
+                        self.latest_timestamps[crypto_key] = ts
+                        self._msg_count += 1
+                        self.on_price(crypto_key, price, ts)
+
+            except asyncio.CancelledError:
+                logger.info("[Chainlink RTDS] Shutting down")
+                break
+            except Exception as e:
+                self._connected = False
+                logger.warning("[Chainlink RTDS] Disconnected: %s, reconnecting in 3s...", e)
+                await asyncio.sleep(3)
 
     def get_price(self, crypto_key: str) -> float:
         return self.latest_prices.get(crypto_key, 0.0)
@@ -607,9 +767,12 @@ class FrequencyOptimizedTrader:
         self.settled_slugs: set[str] = set()
         self._btc_price: float = 0.0                # backward compat
         self._crypto_prices: dict[str, float] = {}   # crypto_key -> price
+        self._chainlink_prices: dict[str, float] = {}
         self._minute_open_prices: dict[str, dict[int, float]] = {}  # crypto_key -> {minute_ts: open_price}
+        self._chainlink_minute_open_prices: dict[str, dict[int, float]] = {}
         self._last_btc_update: float = 0.0
         self.binance_feed: BinanceMultiFeed | None = None
+        self.chainlink_feed: ChainlinkPriceFeed | None = None
         self._ws_eval_queue: asyncio.Queue | None = None  # token_id triggers
         self._token_to_slug: dict[str, str] = {}    # token_id → slug
 
@@ -623,6 +786,10 @@ class FrequencyOptimizedTrader:
         self._started_at = 0
         self._loop_heartbeats: dict[str, float] = {}
         self._loop_restarts: dict[str, float] = {}
+        # Map of loop_name -> asyncio.Task. Used by the watchdog so it can
+        # cancel a stalled task before launching its replacement; without
+        # this the recovery path leaks duplicate loops.
+        self._loop_tasks: dict[str, asyncio.Task] = {}
 
         self._load_trades()
         self._load_v21_state()
@@ -646,6 +813,23 @@ class FrequencyOptimizedTrader:
         with open(PAPER_TRADES_FILE, "a") as f:
             f.write(json.dumps(trade) + "\n")
 
+    def _rewrite_trades_file(self):
+        """Atomically rewrite paper_trades.jsonl from self.trades.
+
+        Called when a previously logged early-exit row needs its
+        actual_outcome backfilled at settlement. Writes via tmp + rename so
+        a crash mid-write cannot truncate the file.
+        """
+        try:
+            os.makedirs(LOGS_DIR, exist_ok=True)
+            tmp_path = PAPER_TRADES_FILE + ".tmp"
+            with open(tmp_path, "w") as f:
+                for t in self.trades:
+                    f.write(json.dumps(t) + "\n")
+            os.replace(tmp_path, PAPER_TRADES_FILE)
+        except Exception as e:
+            logger.error("Failed to rewrite trades file: %s", e)
+
     # ── WS Price Callback ─────────────────────────────────────
 
     def _on_ws_price(self, token_id: str, price: float):
@@ -665,15 +849,39 @@ class FrequencyOptimizedTrader:
         if now - last_restart < 60:
             return
         self._loop_restarts[loop_name] = now
+
+        # Cancel the stalled task before spawning a replacement. Without
+        # this, the watchdog accumulates parallel loops (discovery,
+        # rest-eval) that race on self.active_markets and produce
+        # duplicate trade attempts.
+        old_task = self._loop_tasks.get(loop_name)
+        if old_task is not None and not old_task.done():
+            logger.warning(
+                "Watchdog cancelling stalled task '%s' before spawning replacement",
+                loop_name,
+            )
+            old_task.cancel()
+
         logger.warning("Watchdog restarting stalled loop: %s", loop_name)
         if loop_name == "discovery":
-            asyncio.create_task(self._discovery_loop(), name=f"discovery-recovery-{int(now)}")
+            new_task = asyncio.create_task(
+                self._discovery_loop(), name=f"discovery-recovery-{int(now)}"
+            )
         elif loop_name == "settlement":
-            asyncio.create_task(self._settlement_loop(), name=f"settlement-recovery-{int(now)}")
+            new_task = asyncio.create_task(
+                self._settlement_loop(), name=f"settlement-recovery-{int(now)}"
+            )
         elif loop_name == "rest-eval":
-            asyncio.create_task(self._rest_evaluation_loop(), name=f"rest-eval-recovery-{int(now)}")
+            new_task = asyncio.create_task(
+                self._rest_evaluation_loop(), name=f"rest-eval-recovery-{int(now)}"
+            )
         elif loop_name == "btc-price":
-            asyncio.create_task(self._btc_price_loop(), name=f"btc-price-recovery-{int(now)}")
+            new_task = asyncio.create_task(
+                self._btc_price_loop(), name=f"btc-price-recovery-{int(now)}"
+            )
+        else:
+            return
+        self._loop_tasks[loop_name] = new_task
 
     async def _watchdog_loop(self):
         """Restart critical loops if their heartbeats stop advancing."""
@@ -711,6 +919,18 @@ class FrequencyOptimizedTrader:
             self._btc_price = price           # backward compat
             self._last_btc_update = time.time()
 
+    def _on_chainlink_price(self, crypto_key: str, price: float, ts_ms: int):
+        """Called by ChainlinkPriceFeed on each price tick."""
+        self._chainlink_prices[crypto_key] = price
+        ts_sec = int(ts_ms / 1000)
+        minute_ts = ts_sec - (ts_sec % 60)
+        opens = self._chainlink_minute_open_prices.setdefault(crypto_key, {})
+        opens.setdefault(minute_ts, price)
+        cutoff = minute_ts - 3600
+        stale_minutes = [m for m in opens if m < cutoff]
+        for m in stale_minutes:
+            del opens[m]
+
     def _get_crypto_price(self, crypto_key: str) -> float:
         """Get current price for a crypto asset."""
         return self._crypto_prices.get(crypto_key, 0.0)
@@ -720,6 +940,12 @@ class FrequencyOptimizedTrader:
         if start_ts <= 0:
             return None
         return self._minute_open_prices.get(crypto_key, {}).get(start_ts)
+
+    def _get_cached_chainlink_minute_open(self, crypto_key: str, start_ts: int) -> float | None:
+        """Return cached Chainlink minute open captured from the RTDS feed."""
+        if start_ts <= 0:
+            return None
+        return self._chainlink_minute_open_prices.get(crypto_key, {}).get(start_ts)
 
     def _get_market_lock(self, slug: str) -> asyncio.Lock:
         """Get or create per-market lock to prevent double-entry race condition."""
@@ -871,7 +1097,8 @@ class FrequencyOptimizedTrader:
         """Get the strike price for a crypto up/down market.
 
         Priority: 1) Question text, 2) REST API, 3) Gamma metadata,
-        4) Binance historical open. Never use live price as strike.
+        4) Chainlink RTDS minute open, 5) Binance minute open,
+        6) Binance historical open. Never use live price as strike.
         """
         cfg = CRYPTO_CONFIGS.get(crypto_key, CRYPTO_CONFIGS["btc"])
         min_ptb = cfg.get("min_ptb", 1)
@@ -897,9 +1124,11 @@ class FrequencyOptimizedTrader:
         # 3) Try authoritative Gamma metadata if available.
         gamma_ptb = None
         if market_details:
-            gamma_ptb = _coerce_float(market_details.get("price_to_beat"))
-            if gamma_ptb and gamma_ptb > min_ptb:
-                return gamma_ptb, market_details.get("price_to_beat_source", "gamma_metadata")
+            market_ptb_source = market_details.get("price_to_beat_source", "")
+            if market_ptb_source == "gamma_metadata":
+                gamma_ptb = _coerce_float(market_details.get("price_to_beat"))
+                if gamma_ptb and gamma_ptb > min_ptb:
+                    return gamma_ptb, market_ptb_source
 
         if gamma_ptb is None:
             event = await self._fetch_gamma_event(client, slug)
@@ -908,9 +1137,17 @@ class FrequencyOptimizedTrader:
                 if gamma_ptb and gamma_ptb > min_ptb:
                     return gamma_ptb, "gamma_metadata"
 
-        # 4) For "Up or Down" markets, the strike is the Chainlink BTC/USD
-        #    price at the window OPEN. Prefer the cached minute-open from the
-        #    live Binance trade feed, then fall back to REST klines.
+        # 4) Prefer the cached Chainlink minute-open from Polymarket RTDS.
+        cached_chainlink_open = self._get_cached_chainlink_minute_open(crypto_key, start_ts)
+        if cached_chainlink_open and cached_chainlink_open > min_ptb:
+            logger.info(
+                f"  [{slug}] Using cached Chainlink minute open ${cached_chainlink_open:,.2f} "
+                f"at ts={start_ts} as price_to_beat for {cfg['name']}"
+            )
+            return cached_chainlink_open, "chainlink_rtds_open"
+
+        # 5) For "Up or Down" markets, fall back to the Binance minute open,
+        #    then REST klines if the opening tick wasn't captured live.
         cached_open = self._get_cached_minute_open(crypto_key, start_ts)
         if cached_open and cached_open > min_ptb:
             logger.info(
@@ -928,7 +1165,7 @@ class FrequencyOptimizedTrader:
                 )
                 return hist, "binance_open"
 
-        # 5) All sources failed — return 0 to signal "unknown strike".
+        # 6) All sources failed — return 0 to signal "unknown strike".
         return 0, "unavailable"
 
     async def _check_resolution(self, client: httpx.AsyncClient, slug: str) -> str | None:
@@ -951,7 +1188,9 @@ class FrequencyOptimizedTrader:
         except Exception:
             return None
 
-    async def _fetch_market_details(self, client: httpx.AsyncClient, slug: str) -> dict | None:
+    async def _fetch_market_details(
+        self, client: httpx.AsyncClient, slug: str, crypto_key: str = "btc"
+    ) -> dict | None:
         """Fetch market details (token IDs, condition_id) from Gamma API."""
         fetch_start = time.time()
         try:
@@ -980,7 +1219,7 @@ class FrequencyOptimizedTrader:
             down_token = clob_tokens[down_idx] if len(clob_tokens) > down_idx else None
 
             fetch_ms = (time.time() - fetch_start) * 1000
-            price_to_beat = self._extract_price_to_beat_from_gamma(event, crypto_key="btc")
+            price_to_beat = self._extract_price_to_beat_from_gamma(event, crypto_key=crypto_key)
             return {
                 "question": mkt.get("question", event.get("title", "")),
                 "condition_id": mkt.get("conditionId", ""),
@@ -1040,6 +1279,11 @@ class FrequencyOptimizedTrader:
             await asyncio.sleep(120)  # Check every 2 minutes
 
     async def run(self):
+        # Singleton lock: refuse to start if another process is already trading.
+        # Two FrequencyOptimizedTrader instances on the same wallet produced
+        # the duplicate orders observed on 2026-04-28.
+        self._lock_fh = _acquire_singleton_lock(self.mode)
+
         self.is_running = True
         self._started_at = time.time()
         self._initial_bankroll = self.bankroll  # V6: track for drawdown calc
@@ -1056,33 +1300,61 @@ class FrequencyOptimizedTrader:
         # _load_state resets current_positions to 0 on restart; if we crashed
         # with open positions, safety counter must match reality to avoid
         # exceeding MAX_CONCURRENT_POSITIONS.
+        # IMPORTANT: previous version called trader.get_open_orders() which
+        # returns RESTING CLOB orders, not open positions. FAK orders that
+        # filled disappear from get_orders, so a crash + restart with N
+        # filled-but-unsettled positions would reconcile to 0, letting the
+        # bot open N more on top. We now query data-api/positions which
+        # returns the actual on-chain position set.
         if self.mode != "paper" and self.trader and self.trader.is_ready:
             try:
-                open_orders = await self.trader.get_open_orders()
-                await self.safety.reconcile_positions(len(open_orders))
+                from config import FUNDER_ADDRESS
+                async with httpx.AsyncClient(timeout=10) as _c:
+                    resp = await _c.get(
+                        "https://data-api.polymarket.com/positions",
+                        params={"user": FUNDER_ADDRESS, "sizeThreshold": 0},
+                    )
+                    resp.raise_for_status()
+                    positions = resp.json() or []
+                # Count only un-redeemed positions (size > 0). Resolved
+                # markets without redemption still report size>0; that's
+                # fine — they'll be redeemed by the auto-redeem loop and
+                # cleared from the safety counter when settlement runs.
+                open_count = sum(1 for p in positions if float(p.get("size", 0)) > 0)
+                await self.safety.reconcile_positions(open_count)
             except Exception as e:
-                logger.warning("Safety reconciliation failed: %s", e)
+                logger.warning("Safety reconciliation failed: %s — assuming 0 open positions", e)
+                await self.safety.reconcile_positions(0)
 
         # Start Binance multi-crypto feed
         self.binance_feed = BinanceMultiFeed(
             crypto_keys=ACTIVE_CRYPTOS,
             on_price_callback=self._on_binance_price,
         )
+        self.chainlink_feed = ChainlinkPriceFeed(
+            crypto_keys=ACTIVE_CRYPTOS,
+            on_price_callback=self._on_chainlink_price,
+        )
 
-        tasks = [
-            asyncio.create_task(self._discovery_loop(), name="discovery"),
-            asyncio.create_task(self._ws_evaluation_loop(), name="ws-eval"),
-            asyncio.create_task(self._rest_evaluation_loop(), name="rest-eval"),
-            asyncio.create_task(self._settlement_loop(), name="settlement"),
-            asyncio.create_task(self._btc_price_loop(), name="btc-price"),
-            asyncio.create_task(self.binance_feed.connect(), name="binance-multi-feed"),
-            asyncio.create_task(self.clob_ws.run(), name="clob-ws"),
-            asyncio.create_task(self._status_loop(), name="status"),
-            asyncio.create_task(self._daily_reset_loop(), name="daily-reset"),
-            asyncio.create_task(self._redeem_loop(), name="auto-redeem"),
-            asyncio.create_task(self._position_monitor_loop(), name="position-monitor"),
-            asyncio.create_task(self._watchdog_loop(), name="watchdog"),
-        ]
+        # Track watchdog-managed loops by name so _spawn_loop_recovery can
+        # cancel a stalled task before launching its replacement.
+        named_tasks = {
+            "discovery":        asyncio.create_task(self._discovery_loop(),         name="discovery"),
+            "ws-eval":          asyncio.create_task(self._ws_evaluation_loop(),     name="ws-eval"),
+            "rest-eval":        asyncio.create_task(self._rest_evaluation_loop(),   name="rest-eval"),
+            "settlement":       asyncio.create_task(self._settlement_loop(),        name="settlement"),
+            "btc-price":        asyncio.create_task(self._btc_price_loop(),         name="btc-price"),
+            "binance-feed":     asyncio.create_task(self.binance_feed.connect(),    name="binance-multi-feed"),
+            "chainlink-feed":   asyncio.create_task(self.chainlink_feed.connect(),  name="chainlink-feed"),
+            "clob-ws":          asyncio.create_task(self.clob_ws.run(),             name="clob-ws"),
+            "status":           asyncio.create_task(self._status_loop(),            name="status"),
+            "daily-reset":      asyncio.create_task(self._daily_reset_loop(),       name="daily-reset"),
+            "auto-redeem":      asyncio.create_task(self._redeem_loop(),            name="auto-redeem"),
+            "position-monitor": asyncio.create_task(self._position_monitor_loop(),  name="position-monitor"),
+            "watchdog":         asyncio.create_task(self._watchdog_loop(),          name="watchdog"),
+        }
+        self._loop_tasks = named_tasks
+        tasks = list(named_tasks.values())
 
         try:
             await asyncio.gather(*tasks)
@@ -1123,8 +1395,11 @@ class FrequencyOptimizedTrader:
                             self.discovery.mark_prefetched(slug)
                             continue
 
+                        crypto_key = cand.get("crypto_key", "btc")
                         disc_start = time.time()
-                        details = await self._fetch_market_details(client, slug)
+                        details = await self._fetch_market_details(
+                            client, slug, crypto_key=crypto_key
+                        )
 
                         if details is None:
                             # Market not yet on API — mark as tried, will retry
@@ -1135,7 +1410,6 @@ class FrequencyOptimizedTrader:
                         self.discovery.record_discovery(disc_ms, cand["source"])
 
                         # Get price-to-beat from question text or API
-                        crypto_key = cand.get("crypto_key", "btc")
                         cfg = CRYPTO_CONFIGS.get(crypto_key, CRYPTO_CONFIGS["btc"])
                         min_ptb = cfg.get("min_ptb", 1)
 
@@ -1156,8 +1430,13 @@ class FrequencyOptimizedTrader:
 
                         self.discovery.mark_prefetched(slug)
 
-                        # Register market
-                        self.active_markets[slug] = {
+                        # Register market. Use setdefault so a concurrent
+                        # discovery iteration (or a watchdog-spawned recovery
+                        # loop) cannot overwrite an entry that already has
+                        # info["position"] set — which would silently re-arm
+                        # double-entry. setdefault is atomic at the asyncio
+                        # level since dict assignment cannot be interleaved.
+                        new_entry = {
                             "slug": slug,
                             "crypto_key": crypto_key,
                             "start_ts": cand["start_ts"],
@@ -1169,6 +1448,7 @@ class FrequencyOptimizedTrader:
                             "down_token_id": details["down_token_id"],
                             "price_to_beat": ptb,
                             "price_to_beat_source": ptb_source,
+                            "last_ptb_refresh_at": time.time(),
                             "position": None,
                             "settled": False,
                             "settled_at": 0,
@@ -1178,6 +1458,12 @@ class FrequencyOptimizedTrader:
                             "first_qualified_at": None,
                             "best_qualifying_price": None,
                         }
+                        existing = self.active_markets.setdefault(slug, new_entry)
+                        if existing is not new_entry:
+                            logger.debug(
+                                "Discovery race resolved for %s: keeping existing entry", slug
+                            )
+                            continue
                         self._markets_discovered += 1
 
                         # Subscribe to WS for this market's tokens
@@ -1195,7 +1481,7 @@ class FrequencyOptimizedTrader:
                         logger.info(
                             f"+ DISCOVERED [{cfg['name']}|{cand['tf']}] {slug} | "
                             f"ends in {remaining}s | target=${ptb:,.2f} | "
-                            f"source={cand['source']} ({disc_ms:.0f}ms)"
+                            f"source={ptb_source} | discovered_via={cand['source']} ({disc_ms:.0f}ms)"
                         )
                         self._beat("discovery")
 
@@ -1329,6 +1615,26 @@ class FrequencyOptimizedTrader:
         if info["price_to_beat"] <= min_ptb:
             return
 
+        if (
+            info.get("price_to_beat_source") not in TRUSTED_PTB_SOURCES
+            and time.time() - info.get("last_ptb_refresh_at", 0) >= 5.0
+        ):
+            info["last_ptb_refresh_at"] = time.time()
+            new_ptb, new_source = await self._get_price_to_beat(
+                client,
+                slug,
+                question=info.get("question", ""),
+                crypto_key=crypto_key,
+                start_ts=info.get("start_ts", 0),
+            )
+            if new_ptb > min_ptb and new_source in TRUSTED_PTB_SOURCES:
+                logger.info(
+                    f"  [{slug}] strike refreshed: {info['price_to_beat_source']} "
+                    f"${info['price_to_beat']:,.6g} → {new_source} ${new_ptb:,.6g}"
+                )
+                info["price_to_beat"] = new_ptb
+                info["price_to_beat_source"] = new_source
+
         # Get prices — prefer WS best ask, fallback to REST
         up_ws, down_ws = self._get_share_prices_ws(
             info["up_token_id"], info["down_token_id"]
@@ -1360,6 +1666,27 @@ class FrequencyOptimizedTrader:
             "POSITION_SIZE": cfg.get("position_size", self.params.get("POSITION_SIZE", 0.05)),
         }
 
+        ptb_source = info.get("price_to_beat_source", "unknown")
+        ptb_trusted = ptb_source in TRUSTED_PTB_SOURCES
+        size_factor = 1.0
+        edge_bump = 0.0
+
+        if not ptb_trusted:
+            if STRIKE_GATE_MODE == "strict":
+                logger.debug(
+                    f"  [{slug}] strike-gate(strict): skip — source={ptb_source}"
+                )
+                return
+            if STRIKE_GATE_MODE == "reduced":
+                size_factor = STRIKE_GATE_SIZE_FACTOR
+                edge_bump = STRIKE_GATE_MIN_EDGE_BUMP
+                crypto_params = {
+                    **crypto_params,
+                    "MIN_EDGE": crypto_params.get(
+                        "MIN_EDGE", self.params.get("MIN_EDGE", 0.06)
+                    ) + edge_bump,
+                }
+
         # Run staged entry strategy
         should, side, share_price, est_prob = should_enter_staged(
             time_remaining_seconds=remaining,
@@ -1372,6 +1699,12 @@ class FrequencyOptimizedTrader:
         )
 
         if should:
+            if not ptb_trusted and STRIKE_GATE_MODE == "reduced":
+                logger.info(
+                    f"  [{slug}] strike-gate(reduced): non-trusted source={ptb_source} "
+                    f"→ size×{size_factor}, edge_req+={edge_bump:.3f}"
+                )
+
             # Track first qualification time
             if info["first_qualified_at"] is None:
                 info["first_qualified_at"] = time.time()
@@ -1471,14 +1804,22 @@ class FrequencyOptimizedTrader:
                     f"current=${asset_price:.6g}, distance=${distance:.6g} ({distance_pct:.4f}%), "
                     f"threshold={threshold_pct}%, PASSED (kelly_zone={kelly_zone})"
                 )
-                desired_size = min(self.bankroll * kelly * kelly_mult, _eff_max_trade)
+                # Apply STRIKE_GATE_SIZE_FACTOR for non-trusted strikes —
+                # this multiplier was previously computed at line ~1544 but
+                # never actually applied to the bet, leaving a defensive
+                # control as dead code.
+                desired_size = min(self.bankroll * kelly * kelly_mult * size_factor, _eff_max_trade)
                 if desired_size < MIN_BET_SIZE:
                     logger.info(f"  [{slug}] Kelly bet too small: kelly={kelly:.4f} -> ${desired_size:.2f}, skipping")
                     return
                 kelly_label = kelly_zone
-                logger.info(f"  [{slug}] Kelly sizing ({kelly_label}): edge={edge:.4f} kelly={kelly:.4f} prob={est_prob:.4f} bet=${desired_size:.2f}")
+                logger.info(
+                    f"  [{slug}] Kelly sizing ({kelly_label}): edge={edge:.4f} "
+                    f"kelly={kelly:.4f} prob={est_prob:.4f} size_factor={size_factor:.2f} "
+                    f"bet=${desired_size:.2f}"
+                )
             else:
-                desired_size = min(self.bankroll * FIXED_POSITION_SIZE, _eff_max_trade)
+                desired_size = min(self.bankroll * FIXED_POSITION_SIZE * size_factor, _eff_max_trade)
 
             _chosen_token = info.get("up_token_id", "") if side == "Up" else info.get("down_token_id", "")
             max_acceptable_price = min(share_price + PRICE_BUFFER, 0.99)
@@ -1551,6 +1892,9 @@ class FrequencyOptimizedTrader:
                     f"  [{slug}] Liquidity OK ({liq_source}): ${available_usd:.2f} available vs ${actual_size:.2f} needed"
                 )
 
+            if size_factor < 1.0:
+                actual_size = max(MIN_TRADE_SIZE, actual_size * size_factor)
+
             bet_amount = actual_size
             ask_liquidity = available_usd
 
@@ -1589,6 +1933,9 @@ class FrequencyOptimizedTrader:
                 "liquidity_adjusted": liquidity_adjusted,
                 "original_size": round(desired_size, 2),
                 "actual_size": round(actual_size, 2),
+                "ptb_source": ptb_source,
+                "ptb_trusted_at_entry": ptb_trusted,
+                "strike_gate_size_factor": size_factor,
                 "entry_delay_ms": (time.time() - info["first_qualified_at"]) * 1000 if info["first_qualified_at"] else 0,
             }
 
@@ -1920,6 +2267,9 @@ class FrequencyOptimizedTrader:
             "side": pos.get("side", ""),
             "outcome": "",
             "won": won,
+            "ptb_source": pos.get("ptb_source", "unknown"),
+            "ptb_trusted_at_entry": pos.get("ptb_trusted_at_entry", False),
+            "strike_gate_size_factor": pos.get("strike_gate_size_factor", 1.0),
             "bet_amount": real_bet,
             "payout": round(payout, 6),
             "net_profit": round(actual_pnl, 6),
@@ -1953,6 +2303,9 @@ class FrequencyOptimizedTrader:
             "asset_price": round(pos.get("asset_price", 0), 6),
             "timestamp": int(time.time()),
             "entry_source": pos.get("entry_source", "unknown"),
+            "ptb_source": pos.get("ptb_source", "unknown"),
+            "ptb_trusted_at_entry": pos.get("ptb_trusted_at_entry", False),
+            "strike_gate_size_factor": pos.get("strike_gate_size_factor", 1.0),
             "mode": pos.get("mode", self.mode),
         }
         if exit_type == "hedge":
@@ -1983,11 +2336,21 @@ class FrequencyOptimizedTrader:
         if self.mode == "paper":
             return
 
-        # Re-entry guard: prevent duplicate live positions if called twice for same slug
+        # Re-entry guard. The per-market asyncio.Lock acquired in
+        # _evaluate_market is the primary defense; this synchronous
+        # placeholder is a second layer in case the lock dict gets reset
+        # (e.g. settlement clearing the lock between evaluator hops). The
+        # check + set is two consecutive synchronous statements so no
+        # context switch can interleave them within a single event loop.
         if slug in self._live_positions:
             logger.warning("[%s] _execute_real_trade called but live position already exists, skipping",
                            slug)
             return
+        self._live_positions[slug] = {
+            "status": "pending_execution",
+            "side": side,
+            "timestamp": time.time(),
+        }
 
         cfg = CRYPTO_CONFIGS.get(crypto_key, CRYPTO_CONFIGS["btc"])
 
@@ -2004,23 +2367,37 @@ class FrequencyOptimizedTrader:
                 "slug": slug,
                 "mode": self.mode,
             })
+            self._live_positions.pop(slug, None)
             return
 
-        # Determine trade size (respects liquidity cap from paper evaluation)
+        # Determine trade size. Use the Kelly-derived bet that paper
+        # evaluation already computed (info["position"]["bet_amount"]),
+        # capped by the per-trade wallet ceiling (5% of balance) and the
+        # global MAX_TRADE_SIZE. Previously this used balance*0.05 only,
+        # which discarded Kelly + STRIKE_GATE_SIZE_FACTOR scaling and
+        # caused live size to disagree with paper for non-trivial reasons.
         balance = 0.0
         if self.mode == "shadow":
             trade_size = SHADOW_TRADE_SIZE
         elif self.mode == "live":
             balance = await self.trader.get_balance()
-            # Use liquidity-capped size from position info, then apply live caps
-            liq_capped = info.get("position", {}).get("actual_size", MAX_TRADE_SIZE)
-            trade_size = min(balance * 0.05, liq_capped, MAX_TRADE_SIZE)
+            paper_bet = float(
+                info.get("position", {}).get("bet_amount", 0)
+                or info.get("position", {}).get("actual_size", 0)
+                or 0
+            )
+            wallet_cap = balance * 0.05
+            trade_size = min(paper_bet, wallet_cap, MAX_TRADE_SIZE)
+            if trade_size <= 0:
+                trade_size = min(wallet_cap, MAX_TRADE_SIZE)
         else:
+            self._live_positions.pop(slug, None)
             return
 
         if trade_size < 1.0 or (self.mode == "live" and trade_size > balance):
             logger.info("[%s] Trade size $%.2f not viable (balance=$%.2f), skipping",
                         cfg["name"], trade_size, balance if self.mode == "live" else 0)
+            self._live_positions.pop(slug, None)
             return
 
         # Token ID
@@ -2032,6 +2409,7 @@ class FrequencyOptimizedTrader:
         if not token_id:
             logger.error("[%s] No token_id for side=%s in %s",
                          cfg["name"], side, slug)
+            self._live_positions.pop(slug, None)
             return
 
         # Log order book state at execution time
@@ -2074,6 +2452,7 @@ class FrequencyOptimizedTrader:
             if not order_success or actual_filled <= 0:
                 logger.warning("[%s] Zero fill — no position recorded (success=%s filled=$%.2f)",
                                cfg["name"], order_success, actual_filled)
+                self._live_positions.pop(slug, None)
                 return
         except Exception as e:
             logger.error("[%s] Order execution failed: %s", cfg["name"], e)
@@ -2085,6 +2464,7 @@ class FrequencyOptimizedTrader:
                 "slug": slug,
                 "mode": self.mode,
             })
+            self._live_positions.pop(slug, None)
             return
 
         # Record live position
@@ -2185,12 +2565,11 @@ class FrequencyOptimizedTrader:
         asset_price = self._get_crypto_price(crypto_key)
 
         outcome = await self._check_resolution(client, slug)
-        trusted_ptb_sources = {"question", "rest_api", "gamma_metadata"}
 
         if outcome is None:
             if expired_for < 35:
                 return  # Retry next cycle
-            if info.get("price_to_beat_source") not in trusted_ptb_sources:
+            if info.get("price_to_beat_source") not in TRUSTED_PTB_SOURCES:
                 refreshed_ptb, refreshed_source = await self._get_price_to_beat(
                     client,
                     slug,
@@ -2211,7 +2590,7 @@ class FrequencyOptimizedTrader:
                     info["price_to_beat"] = refreshed_ptb
                     info["price_to_beat_source"] = refreshed_source
 
-            if info.get("price_to_beat_source") not in trusted_ptb_sources:
+            if info.get("price_to_beat_source") not in TRUSTED_PTB_SOURCES:
                 logger.warning(
                     f"  [{cfg['name']}] {slug} → waiting for authoritative strike; "
                     f"current source={info.get('price_to_beat_source', 'unknown')}"
@@ -2238,13 +2617,19 @@ class FrequencyOptimizedTrader:
         else:
             logger.info(f"  {slug} → resolved {outcome}")
 
+        await self._log_chainlink_strike_discrepancy(client, slug, info, crypto_key)
+
         info["settled"] = True
         info["settled_at"] = now
         self.settled_slugs.add(slug)
 
-        # Clean up per-market lock to prevent memory leak
-        if slug in self._market_locks:
-            del self._market_locks[slug]
+        # Per-market lock retention: previously this deleted the lock at
+        # settlement to "prevent a memory leak". The leak was overblown
+        # (_prune trims state), but the deletion creates a real race —
+        # if a concurrent evaluator was awaiting on this lock object and
+        # the dict entry is deleted, a fresh _get_market_lock() call
+        # creates a *different* Lock instance, breaking serialization.
+        # We now keep the locks; _prune handles long-term growth.
 
         # Log performance data for this window
         perf_data = {
@@ -2259,6 +2644,7 @@ class FrequencyOptimizedTrader:
             "qualified_at": info.get("first_qualified_at"),
             "best_entry_price": info.get("best_qualifying_price"),
             "traded": info["position"] is not None,
+            "ptb_source": info.get("price_to_beat_source", "unknown"),
             "actual_outcome": outcome,
             "timestamp": now,
         }
@@ -2343,6 +2729,9 @@ class FrequencyOptimizedTrader:
                     "side": pos["side"],
                     "outcome": outcome,
                     "won": won_real,
+                    "ptb_source": pos.get("ptb_source", "unknown"),
+                    "ptb_trusted_at_entry": pos.get("ptb_trusted_at_entry", False),
+                    "strike_gate_size_factor": pos.get("strike_gate_size_factor", 1.0),
                     "bet_amount": real_bet,
                     "payout": real_payout,
                     "net_profit": round(actual_pnl, 6),
@@ -2407,6 +2796,9 @@ class FrequencyOptimizedTrader:
             "btc_distance": round(pos.get("btc_distance", pos.get("asset_distance", 0)), 2),
             "timestamp": pos["entry_time"],
             "entry_source": pos.get("entry_source", "unknown"),
+            "ptb_source": pos.get("ptb_source", "unknown"),
+            "ptb_trusted_at_entry": pos.get("ptb_trusted_at_entry", False),
+            "strike_gate_size_factor": pos.get("strike_gate_size_factor", 1.0),
             "mode": pos.get("mode", self.mode),
             "order_id": pos.get("order_result", {}).get("order_id", ""),
             "available_liquidity_usd": pos.get("available_liquidity_usd", 0),
@@ -2460,6 +2852,9 @@ class FrequencyOptimizedTrader:
                 "side": pos["side"],
                 "outcome": outcome,
                 "won": won,
+                "ptb_source": pos.get("ptb_source", "unknown"),
+                "ptb_trusted_at_entry": pos.get("ptb_trusted_at_entry", False),
+                "strike_gate_size_factor": pos.get("strike_gate_size_factor", 1.0),
                 "bet_amount": live_pos.get("trade_size_usd", 0),
                 "payout": (real_shares if won else 0.0),
                 "net_profit": round(actual_pnl, 6),
@@ -2468,6 +2863,37 @@ class FrequencyOptimizedTrader:
             })
             del self._live_positions[slug]
             self._save_v21_state()
+
+    async def _log_chainlink_strike_discrepancy(
+        self, client: httpx.AsyncClient, slug: str, info: dict, crypto_key: str
+    ):
+        """Log Chainlink-vs-authoritative strike differences for audit purposes."""
+        cfg = CRYPTO_CONFIGS.get(crypto_key, CRYPTO_CONFIGS["btc"])
+        min_ptb = cfg.get("min_ptb", 1)
+        chainlink_open = self._get_cached_chainlink_minute_open(
+            crypto_key, info.get("start_ts", 0)
+        )
+        if not chainlink_open or chainlink_open <= min_ptb:
+            return
+
+        authoritative_ptb, authoritative_source = await self._get_price_to_beat(
+            client,
+            slug,
+            question=info.get("question", ""),
+            crypto_key=crypto_key,
+        )
+        if authoritative_source not in {"question", "rest_api", "gamma_metadata"}:
+            return
+        if authoritative_ptb <= min_ptb:
+            return
+
+        diff_abs = abs(chainlink_open - authoritative_ptb)
+        diff_bps = (diff_abs / authoritative_ptb) * 10_000 if authoritative_ptb else 0.0
+        logger.info(
+            f"  [{cfg['name']}] {slug} → chainlink strike check: "
+            f"chainlink=${chainlink_open:,.6g} vs {authoritative_source}=${authoritative_ptb:,.6g} "
+            f"(Δ=${diff_abs:,.6g}, {diff_bps:.2f}bps)"
+        )
 
     # ── Status Loop ───────────────────────────────────────────
 
@@ -2491,6 +2917,10 @@ class FrequencyOptimizedTrader:
         """Periodic status logging."""
         while self.is_running:
             await asyncio.sleep(30)
+            # Trim long-lived state — settled_slugs in particular grows
+            # unbounded across days (a few thousand markets per day) and
+            # _prune was previously defined but never called.
+            self._prune()
             # Refresh wallet balance if in live/shadow mode
             if self.mode != "paper" and self.trader and self.trader.is_ready:
                 try:
@@ -2529,6 +2959,21 @@ class FrequencyOptimizedTrader:
     def _prune(self):
         if len(self.settled_slugs) > 2000:
             self.settled_slugs = set(list(self.settled_slugs)[-1000:])
+        # Drop per-market locks for slugs that are no longer active.
+        # We retain locks for slugs in active_markets (even settled-but-
+        # not-yet-cleaned ones) so any in-flight evaluator continues to
+        # serialize correctly. Stale entries are safe to drop.
+        if len(self._market_locks) > 500:
+            stale_locks = [
+                s for s in list(self._market_locks.keys())
+                if s not in self.active_markets
+            ]
+            for s in stale_locks:
+                # Don't drop locks that are currently held — that would let
+                # a fresh _get_market_lock() call hand out a different Lock.
+                lock = self._market_locks[s]
+                if not lock.locked():
+                    del self._market_locks[s]
 
 
     def _get_crypto_pnl(self) -> dict:
@@ -2666,7 +3111,28 @@ class FrequencyOptimizedTrader:
 # ═══════════════════════════════════════════════════════════════
 
 async def main():
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Polymarket Frequency-Optimized Trader (paper / shadow / live).",
+    )
+    parser.add_argument(
+        "--mode", choices=["paper", "shadow", "live"], default=None,
+        help="Override TRADING_MODE from config.py.",
+    )
+    parser.add_argument(
+        "--port", type=int, default=None,
+        help="Accepted for compatibility with restart scripts; the dashboard "
+             "listens on DASHBOARD_PORT from config. The trader itself does "
+             "not bind a port.",
+    )
+    args = parser.parse_args()
+
     trader = FrequencyOptimizedTrader()
+    if args.mode:
+        trader.mode = args.mode
+        logger.info("Trade mode overridden via --mode: %s", args.mode)
+    if args.port is not None:
+        logger.info("--port=%d ignored by trader (set DASHBOARD_PORT in config)", args.port)
     await trader.run()
 
 

@@ -210,6 +210,24 @@ MAX_ENTRY_PRICE_ABS = 0.99   # absolute ceiling — reject orders above this
 MIN_EDGE = 0.06              # strategy entry gate — high-edge opportunities only
 MIN_EDGE_POST_BUFFER = 0.03  # post-buffer safety net — buffer didn't eat all edge
 
+# ── Strike-source gate (8087) ──────────────────────────────────────────────
+# Strikes from question text, REST, Gamma metadata, and Polymarket's RTDS
+# Chainlink feed are treated as authoritative for entry purposes. Binance
+# minute-open and historical-open strikes remain useful fallbacks, but they are
+# proxies rather than the resolution source.
+#
+# Modes:
+#   "strict"  — refuse entries unless the strike source is trusted.
+#   "reduced" — allow non-trusted strikes at reduced size and tighter edge.
+#   "off"     — disable the gate completely.
+STRIKE_GATE_MODE = "reduced"
+STRIKE_GATE_SIZE_FACTOR = 0.5
+STRIKE_GATE_MIN_EDGE_BUMP = 0.02
+
+TRUSTED_PTB_SOURCES = frozenset({
+    "question", "rest_api", "gamma_metadata", "chainlink_rtds_open",
+})
+
 # ── Fees ──────────────────────────────────────────────────────
 POLY_CRYPTO_FEE_RATE = 0.072
 

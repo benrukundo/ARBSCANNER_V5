@@ -11,6 +11,7 @@ from config import (
     TRADE_LOG, ERROR_LOG, DATA_DIR,
     PRICE_BUFFER, MIN_ENTRY_PRICE,
     MAX_ENTRY_PRICE, MAX_ENTRY_PRICE_ABS, MIN_EDGE_POST_BUFFER,
+    POLY_CRYPTO_FEE_RATE,
 )
 
 logger = logging.getLogger("v21.trading_client")
@@ -260,8 +261,11 @@ class PolymarketTrader:
                         "edge_after_buffer": edge_after_buffer,
                     }
 
-            # Recalculate fee using buffered price
-            fee = (amount / buffered_price) * 0.072 * buffered_price * (1 - buffered_price) if buffered_price > 0 else 0
+            # Recalculate fee using buffered price (informational logging only).
+            fee = (
+                (amount / buffered_price) * POLY_CRYPTO_FEE_RATE * buffered_price * (1 - buffered_price)
+                if buffered_price > 0 else 0
+            )
             logger.info("Fee at buffered price: $%.4f (%.2f%%)", fee, (fee / amount * 100) if amount > 0 else 0)
 
             rounded_price = buffered_price
