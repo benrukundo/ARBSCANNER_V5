@@ -1,4 +1,12 @@
-"""Trading Client for V2.1 — wraps py-clob-client for real order execution."""
+"""Trading Client — wraps py-clob-client-v2 for real order execution.
+
+Migrated from py-clob-client (V1) to py-clob-client-v2 on 2026-04-28
+because Polymarket cut over to CTF Exchange V2 at ~11:00 UTC. After the
+cutover, V1-signed orders are rejected with HTTP 400
+{"error": "order_version_mismatch"}. The V2 SDK uses the new exchange
+contracts, the new EIP-712 domain version "2", removes feeRateBps from
+the order struct, and treats pUSD as collateral instead of USDC.e.
+"""
 import json
 import logging
 import os
@@ -44,17 +52,21 @@ class PolymarketTrader:
             return
 
         try:
-            from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import ApiCreds
+            # V2 SDK — required after Polymarket's CTF Exchange V2 cutover
+            # on 2026-04-28. The V1 SDK (py_clob_client) signs against the
+            # old EIP-712 domain version "1" and the old exchange addresses,
+            # producing "order_version_mismatch" 400s post-cutover.
+            from py_clob_client_v2 import ClobClient, ApiCreds
 
-            # Try loading cached API creds
+            # Try loading cached API creds. The L2 API creds (apiKey,
+            # secret, passphrase) survive the V1→V2 cutover; only the
+            # exchange contract and order struct changed.
             creds_file = os.path.join(DATA_DIR, "api_creds.json")
             api_key = API_KEY
             api_secret = API_SECRET
             api_passphrase = API_PASSPHRASE
 
             if not api_key:
-                # Try loading from cache
                 if os.path.exists(creds_file):
                     with open(creds_file) as f:
                         cached = json.load(f)
@@ -64,18 +76,16 @@ class PolymarketTrader:
                     logger.info("Loaded cached API credentials")
 
             if not api_key:
-                # Derive new API creds
-                logger.info("Deriving new API credentials...")
+                logger.info("Deriving new API credentials via V2 client...")
                 temp_client = ClobClient(
-                    CLOB_HOST, key=PRIVATE_KEY,
+                    CLOB_HOST,
+                    key=PRIVATE_KEY,
                     chain_id=CHAIN_ID,
                     funder=FUNDER_ADDRESS,
                     signature_type=SIGNATURE_TYPE,
                 )
                 creds = temp_client.derive_api_key()
-                # derive_api_key() may return ApiCreds object or dict
-                if hasattr(creds, 'api_key'):
-                    # ApiCreds object
+                if hasattr(creds, "api_key"):
                     api_key = creds.api_key
                     api_secret = creds.api_secret
                     api_passphrase = creds.api_passphrase
@@ -86,21 +96,24 @@ class PolymarketTrader:
                 else:
                     raise ValueError(f"Unexpected creds type: {type(creds)}")
 
-                # Cache for next restart
                 os.makedirs(DATA_DIR, exist_ok=True)
-                creds_dict = {"apiKey": api_key, "secret": api_secret, "passphrase": api_passphrase}
+                creds_dict = {
+                    "apiKey": api_key,
+                    "secret": api_secret,
+                    "passphrase": api_passphrase,
+                }
                 with open(creds_file, "w") as f:
                     json.dump(creds_dict, f, indent=2)
                 logger.info("API credentials derived and cached")
 
-            # Create authenticated client
             api_creds = ApiCreds(
                 api_key=api_key,
                 api_secret=api_secret,
                 api_passphrase=api_passphrase,
             )
             self.client = ClobClient(
-                CLOB_HOST, key=PRIVATE_KEY,
+                CLOB_HOST,
+                key=PRIVATE_KEY,
                 chain_id=CHAIN_ID,
                 signature_type=SIGNATURE_TYPE,
                 funder=FUNDER_ADDRESS,
@@ -108,34 +121,15 @@ class PolymarketTrader:
             )
             self._initialized = True
 
-            # ── Fee support check (CRITICAL for crypto fee-enabled markets) ──
-            # Polymarket crypto markets require feeRateBps in signed orders.
-            # If py-clob-client is too old, orders WILL be rejected.
-            self._fee_supported = True
+            # Sanity-log SDK version so post-incident logs show what was running.
             try:
-                import py_clob_client
-                try:
-                    from importlib.metadata import version as _get_version
-                    clob_version = _get_version("py-clob-client")
-                except Exception:
-                    clob_version = getattr(py_clob_client, "__version__", "0.0.0")
-                from packaging.version import Version
-                if Version(clob_version) < Version("0.15.0"):
-                    self._fee_supported = False
-                    logger.critical(
-                        "py-clob-client version %s is too old — feeRateBps not supported. "
-                        "Orders WILL be rejected on fee-enabled markets. "
-                        "Please upgrade: pip install --upgrade py-clob-client",
-                        clob_version
-                    )
-                else:
-                    logger.info("py-clob-client version %s — fee support OK", clob_version)
-            except ImportError:
-                logger.info("packaging not installed — skipping version check, assuming fee support OK")
-            except Exception as ve:
-                logger.warning("Fee version check failed: %s — assuming OK", ve)
-
-            logger.info("PolymarketTrader initialized (CLOB client ready)")
+                from importlib.metadata import version as _get_version
+                logger.info(
+                    "PolymarketTrader initialized — py_clob_client_v2 %s (CTF Exchange V2)",
+                    _get_version("py-clob-client-v2"),
+                )
+            except Exception:
+                logger.info("PolymarketTrader initialized (V2 SDK)")
 
         except Exception as e:
             log_error(f"Failed to initialize trading client: {e}", e)
@@ -145,18 +139,26 @@ class PolymarketTrader:
         return self._initialized and self.client is not None
 
     async def get_balance(self) -> float:
-        """Get USDC balance (cached for 30s)."""
+        """Get pUSD collateral balance (cached for 30s).
+
+        Post-V2 cutover, the collateral token is pUSD (still 6 decimals,
+        backed by USDC). The V2 SDK abstracts this — AssetType.COLLATERAL
+        returns the pUSD balance.
+        """
         now = time.time()
         if now - self._balance_cache[1] < 30:
             return self._balance_cache[0]
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=SIGNATURE_TYPE)
+            from py_clob_client_v2 import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                signature_type=SIGNATURE_TYPE,
+            )
             raw = self.client.get_balance_allowance(params)
-            logger.info("RAW balance response: %s", raw)
-            balance = float(raw.get("balance", 0)) / 1e6  # USDC 6 decimals
+            logger.debug("RAW balance response: %s", raw)
+            balance = float(raw.get("balance", 0)) / 1e6  # pUSD has 6 decimals
             self._balance_cache = (balance, now)
-            logger.info("Wallet balance: $%.2f", balance)
+            logger.info("Wallet balance (pUSD): $%.2f", balance)
             return balance
         except Exception as e:
             log_error(f"Balance check failed: {e}", e)
@@ -165,39 +167,18 @@ class PolymarketTrader:
     async def place_order(self, token_id: str, side: str, size_usd: float,
                           price: float, market_slug: str = "",
                           estimated_prob: float = None) -> dict:
-        """Place a FAK order on the CLOB using MarketOrderArgs (USDC-based).
+        """Place a FAK BUY order on the CLOB using V2 MarketOrderArgs.
 
-        Uses create_market_order instead of create_order to avoid CLOB API
-        'invalid amounts' errors. MarketOrderArgs takes USDC amount directly,
-        ensuring maker_amount (USDC) stays at ≤2 decimal precision.
+        V2 differences from V1:
+        - feeRateBps no longer goes in the order struct; the V2 client
+          resolves the fee server-side from the token's fee schedule.
+        - The order is signed against EIP-712 domain version "2" and
+          submitted to the CTF Exchange V2 contract; signing is handled
+          internally by the V2 SDK.
+        - We continue to use FAK (fill-or-kill at limit price) so unfilled
+          orders disappear instead of resting on the book.
         """
-        from py_clob_client.clob_types import MarketOrderArgs, OrderType
-
-        # ── CRITICAL: Verify fee support before placing any order ──
-        if hasattr(self, "_fee_supported") and not self._fee_supported:
-            logger.error("REFUSING to place order — py-clob-client too old for feeRateBps")
-            return {
-                "success": False,
-                "order_id": None,
-                "status": "fee_unsupported",
-                "error": "py-clob-client version too old for fee support",
-                "filled_size": 0,
-                "intended_size": size_usd,
-                "fill_ratio": 0,
-                "slippage": 0,
-            }
-
-        # Query current fee rate from CLOB API (non-blocking)
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=5) as _client:
-                fee_resp = await _client.get(
-                    f"https://clob.polymarket.com/fee-rate?token_id={token_id}",
-                )
-                fee_data = fee_resp.json()
-            logger.info("Fee rate for %s: %s", token_id[:16], fee_data)
-        except Exception as fe:
-            logger.warning("Fee rate query failed: %s — proceeding with order", fe)
+        from py_clob_client_v2 import MarketOrderArgs, OrderType
 
         append_jsonl(TRADE_LOG, {
             "timestamp": time.time(),
@@ -272,15 +253,21 @@ class PolymarketTrader:
             logger.info("Placing market order: %s $%.2f @ %.4f (ask=%.4f + buffer) | %s",
                         side, amount, rounded_price, market_ask, market_slug)
 
+            # V2 MarketOrderArgs no longer carries feeRateBps; the server
+            # applies the schedule for the token. The `side` field accepts
+            # the literal string "BUY"/"SELL" or the Side enum — string
+            # form keeps the rest of the codebase unchanged.
             order_args = MarketOrderArgs(
                 token_id=token_id,
                 amount=amount,
                 price=rounded_price,
                 side=side,
+                order_type=OrderType.FAK,
             )
 
             signed_order = self.client.create_market_order(order_args)
-            result = self.client.post_order(signed_order, orderType=OrderType.FAK)
+            # V2 renamed the kwarg from orderType to order_type.
+            result = self.client.post_order(signed_order, order_type=OrderType.FAK)
 
             order_id = result.get("orderID", result.get("id", "unknown"))
             status = result.get("status", "unknown")
