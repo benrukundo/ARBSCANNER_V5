@@ -1351,6 +1351,7 @@ class FrequencyOptimizedTrader:
             "daily-reset":      asyncio.create_task(self._daily_reset_loop(),       name="daily-reset"),
             "auto-redeem":      asyncio.create_task(self._redeem_loop(),            name="auto-redeem"),
             "position-monitor": asyncio.create_task(self._position_monitor_loop(),  name="position-monitor"),
+            "pnl-reconcile":    asyncio.create_task(self._pnl_reconcile_loop(),     name="pnl-reconcile"),
             "watchdog":         asyncio.create_task(self._watchdog_loop(),          name="watchdog"),
         }
         self._loop_tasks = named_tasks
@@ -2038,6 +2039,19 @@ class FrequencyOptimizedTrader:
                         in_range += 1  # count as in range for heartbeat
                         continue
 
+                    # ── Live mode: hold to natural settlement ──
+                    # The TP/SL/hedge branches below only book paper P&L —
+                    # they never actually placed sell orders on the CLOB.
+                    # That made the dashboard report fictional profits while
+                    # the wallet only saw natural redemptions (the +$46
+                    # paper claim vs the -$1.84 wallet on 2026-04-29). For
+                    # live trades we now skip dynamic exits entirely and
+                    # let positions resolve at expiry. Paper mode keeps the
+                    # full TP/SL/hedge simulation as a strategy backtest.
+                    if self.mode != "paper":
+                        in_range += 1
+                        continue
+
                     # Use the new fallback method that estimates from opposite ask
                     best_bid = self.clob_ws.get_best_bid_or_estimate(token_id, other_token_id)
                     bid_source = "ws" if best_bid else None
@@ -2597,14 +2611,36 @@ class FrequencyOptimizedTrader:
                 )
                 return
 
-            # Prefer historical price AT market close over current live price.
-            # For 5m markets especially, 35+ seconds of drift between end_ts and
-            # "now" can flip the inferred outcome vs what Polymarket will
-            # eventually resolve to. Fall back to live price only if hist fetch
-            # fails entirely.
-            close_price = await self._get_historical_price(client, crypto_key, info["end_ts"])
+            # Polymarket resolves crypto up/down markets via the Chainlink
+            # RTDS oracle. Inferring outcomes from Binance — as the original
+            # code did — systematically disagrees with Polymarket on tight
+            # strikes (the bug that booked btc-updown-5m-1777431600 as a
+            # +$7.02 win on 2026-04-29 03:05 UTC, while the wallet redeemed
+            # $0 because Chainlink reported close < strike).
+            #
+            # The bot already collects Chainlink minute-opens via
+            # _on_chainlink_price → self._chainlink_minute_open_prices.
+            # Use that as the primary source. Fall back to Binance only if
+            # Chainlink missed the tick at end_ts (e.g. WS reconnect window),
+            # and to live price as last resort. close_price_source goes into
+            # the perf record so we can audit which oracle decided each
+            # settlement.
+            close_price = self._get_cached_chainlink_minute_open(
+                crypto_key, info["end_ts"]
+            )
+            close_price_source = "chainlink_rtds_open"
+            if close_price is None:
+                close_price = await self._get_historical_price(
+                    client, crypto_key, info["end_ts"]
+                )
+                close_price_source = "binance_kline_open"
+                logger.warning(
+                    f"  [{cfg['name']}] {slug} → no Chainlink open at "
+                    f"end_ts={info['end_ts']}; falling back to Binance"
+                )
             if close_price is None:
                 close_price = asset_price
+                close_price_source = "live_fallback"
                 logger.warning(
                     f"  [{cfg['name']}] {slug} → historical fetch failed, "
                     f"using live price ${close_price:,.6g} for inference"
@@ -2612,8 +2648,10 @@ class FrequencyOptimizedTrader:
             outcome = "Up" if close_price >= info["price_to_beat"] else "Down"
             logger.info(
                 f"  [{cfg['name']}] {slug} → inferred {outcome} "
-                f"(close=${close_price:,.6g} vs strike=${info['price_to_beat']:,.6g})"
+                f"(close=${close_price:,.6g} via {close_price_source} "
+                f"vs strike=${info['price_to_beat']:,.6g})"
             )
+            info["close_price_source"] = close_price_source
         else:
             logger.info(f"  {slug} → resolved {outcome}")
 
@@ -2912,6 +2950,55 @@ class FrequencyOptimizedTrader:
             if self.is_running:
                 await self.safety.daily_reset()
                 logger.info("Daily safety reset completed")
+
+    async def _pnl_reconcile_loop(self):
+        """Overwrite real_pnl_total with on-chain truth from data-api.
+
+        Why this exists: the bot was previously summing its own settlement
+        inferences into self.real_pnl_total, which double-counted paper
+        TP fantasies and mis-inferred close prices. The wallet's true
+        realized P&L is (Buys − Redeems − Sells) which only data-api can
+        report authoritatively. Run every 60s in shadow/live; skip in
+        paper since paper has no on-chain trail.
+
+        On a divergence > $0.50 we log a WARNING so future incidents
+        surface in v7.log instead of being hidden behind a happy
+        dashboard.
+        """
+        if self.mode == "paper":
+            logger.info("PnL reconciliation disabled in paper mode")
+            return
+        # First pass right after startup; then every 60s.
+        await asyncio.sleep(20)
+        while self.is_running:
+            try:
+                if self.trader and self.trader.is_ready:
+                    snap = await self.trader.fetch_realized_pnl()
+                    if snap and "realized_pnl" in snap:
+                        wallet_pnl = float(snap["realized_pnl"])
+                        prev = self.real_pnl_total
+                        self.real_pnl_total = wallet_pnl
+                        if abs(wallet_pnl - prev) >= 0.50:
+                            logger.warning(
+                                "PNL_RECONCILE: bot=$%.4f -> wallet=$%.4f "
+                                "(buys=%d/$%.2f redeems=%d/$%.2f sells=%d/$%.2f)",
+                                prev, wallet_pnl,
+                                snap["n_buys"], snap["total_buys_usd"],
+                                snap["n_redeems"], snap["total_redeems_usd"],
+                                snap["n_sells"], snap["total_sells_usd"],
+                            )
+                        else:
+                            logger.info(
+                                "PNL_RECONCILE: wallet realized P&L=$%.4f "
+                                "(buys=%d/$%.2f, redeems+sells=%d/$%.2f)",
+                                wallet_pnl,
+                                snap["n_buys"], snap["total_buys_usd"],
+                                snap["n_redeems"] + snap["n_sells"],
+                                snap["total_redeems_usd"] + snap["total_sells_usd"],
+                            )
+            except Exception as e:
+                logger.warning("PnL reconciliation error: %s", e)
+            await asyncio.sleep(60)
 
     async def _status_loop(self):
         """Periodic status logging."""

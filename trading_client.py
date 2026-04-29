@@ -164,129 +164,169 @@ class PolymarketTrader:
             log_error(f"Balance check failed: {e}", e)
             return self._balance_cache[0]
 
-    async def place_order(self, token_id: str, side: str, size_usd: float,
-                          price: float, market_slug: str = "",
+    async def place_order(self, token_id: str, side: str,
+                          size_usd: float = 0.0, shares: float = 0.0,
+                          price: float = 0.0, market_slug: str = "",
                           estimated_prob: float = None) -> dict:
-        """Place a FAK BUY order on the CLOB using V2 MarketOrderArgs.
+        """Place a FAK BUY or SELL order on the CLOB via V2 SDK.
+
+        BUY:  pass `size_usd` (USDC amount to spend); shares received = size_usd/price.
+              Applies PRICE_BUFFER to the limit price for reliable fills.
+        SELL: pass `shares` (number of CTF tokens to sell); USDC received ≈ shares*price.
+              No buffer applied — the limit is the bid we accept; we do NOT
+              concede price to fill, the position monitor decides the bid
+              threshold and accepts only fills at that bid or better.
 
         V2 differences from V1:
-        - feeRateBps no longer goes in the order struct; the V2 client
-          resolves the fee server-side from the token's fee schedule.
+        - feeRateBps no longer goes in the order struct; the V2 server
+          resolves the fee schedule for the token at submission time.
         - The order is signed against EIP-712 domain version "2" and
-          submitted to the CTF Exchange V2 contract; signing is handled
-          internally by the V2 SDK.
-        - We continue to use FAK (fill-or-kill at limit price) so unfilled
-          orders disappear instead of resting on the book.
+          submitted to the CTF Exchange V2 contract; signing handled by
+          the V2 SDK.
+        - FAK = Fill-And-Kill at the limit price — anything not matched
+          immediately is cancelled (no resting order on the book).
         """
         from py_clob_client_v2 import MarketOrderArgs, OrderType
+
+        side_norm = side.upper()
+        if side_norm not in ("BUY", "SELL"):
+            return {"success": False, "status": "invalid_side", "filled_size": 0,
+                    "intended_size": size_usd if side_norm == "BUY" else shares,
+                    "fill_ratio": 0}
 
         append_jsonl(TRADE_LOG, {
             "timestamp": time.time(),
             "type": "order_intent",
             "token_id": token_id,
-            "side": side,
-            "size_usd": size_usd,
+            "side": side_norm,
+            "size_usd": size_usd if side_norm == "BUY" else shares * price,
+            "shares": shares if side_norm == "SELL" else 0,
             "price": price,
             "market_slug": market_slug,
         })
 
         try:
-            # Round USDC amount to 2 decimals (cents) — ensures maker precision
-            amount = round(size_usd, 2)
+            if side_norm == "BUY":
+                # Round USDC amount to 2 decimals (cents) — ensures maker precision
+                amount = round(size_usd, 2)
 
-            # ── Apply PRICE_BUFFER for reliable FAK fills ──
-            # MAX_ENTRY_PRICE, MAX_ENTRY_PRICE_ABS, MIN_EDGE_POST_BUFFER imported
-            # from config. NOTE: the post-buffer edge check below uses
-            # MIN_EDGE_POST_BUFFER (a lenient safety net, not MIN_EDGE). The
-            # strategy entry gate in strategy.py already enforced MIN_EDGE on
-            # the raw ask; here we only verify the buffer didn't eat ALL the
-            # edge. Applying MIN_EDGE again here would charge the buffer cost
-            # twice against the edge budget and reject profitable trades.
+                # ── Apply PRICE_BUFFER for reliable FAK fills ──
+                # MAX_ENTRY_PRICE, MAX_ENTRY_PRICE_ABS, MIN_EDGE_POST_BUFFER
+                # from config. The post-buffer edge check below uses
+                # MIN_EDGE_POST_BUFFER (a lenient safety net, not MIN_EDGE).
+                # The strategy entry gate already enforced MIN_EDGE on the
+                # raw ask; here we only verify the buffer didn't eat ALL
+                # the edge. Applying MIN_EDGE again would double-charge.
+                market_ask = round(price, 2)
+                buffered_price = round(min(market_ask + PRICE_BUFFER, MAX_ENTRY_PRICE), 2)
+                logger.info("Price buffer: market_ask=%.4f -> order=%.4f (buffer=%.2f)",
+                            market_ask, buffered_price, PRICE_BUFFER)
 
-            market_ask = round(price, 2)
-            buffered_price = round(min(market_ask + PRICE_BUFFER, MAX_ENTRY_PRICE), 2)
-            logger.info("Price buffer: market_ask=%.4f -> order=%.4f (buffer=%.2f)",
-                        market_ask, buffered_price, PRICE_BUFFER)
+                if buffered_price > MAX_ENTRY_PRICE:
+                    logger.warning("Buffered price %.4f > MAX_ENTRY_PRICE %.2f — capping",
+                                   buffered_price, MAX_ENTRY_PRICE)
+                    buffered_price = MAX_ENTRY_PRICE
 
-            # Safety check: cap at MAX_ENTRY_PRICE
-            if buffered_price > MAX_ENTRY_PRICE:
-                logger.warning("Buffered price %.4f > MAX_ENTRY_PRICE %.2f — capping",
-                               buffered_price, MAX_ENTRY_PRICE)
-                buffered_price = MAX_ENTRY_PRICE
-
-            # Safety check: reject above MAX_ENTRY_PRICE_ABS
-            if buffered_price > MAX_ENTRY_PRICE_ABS:
-                logger.warning("Buffered price %.4f > MAX_ENTRY_PRICE_ABS %.2f — rejecting",
-                               buffered_price, MAX_ENTRY_PRICE_ABS)
-                return {
-                    "success": False, "order_id": None, "status": "price_too_high",
-                    "filled_size": 0, "intended_size": size_usd, "fill_ratio": 0, "slippage": 0,
-                }
-
-            # Recalculate edge after buffer — circuit-breaker, not quality filter.
-            # See comment above re: why this uses MIN_EDGE_POST_BUFFER not MIN_EDGE.
-            if estimated_prob is not None:
-                edge_after_buffer = estimated_prob - buffered_price
-                logger.info(
-                    "Edge after buffer: est_prob=%.4f - buffered=%.4f = edge=%.4f (min_post_buffer=%.2f)",
-                    estimated_prob, buffered_price, edge_after_buffer, MIN_EDGE_POST_BUFFER,
-                )
-                if edge_after_buffer < MIN_EDGE_POST_BUFFER:
-                    logger.info(
-                        "SKIPPED: edge_after_buffer=%.4f < MIN_EDGE_POST_BUFFER=%.2f — buffer eats the edge",
-                        edge_after_buffer, MIN_EDGE_POST_BUFFER,
-                    )
+                if buffered_price > MAX_ENTRY_PRICE_ABS:
+                    logger.warning("Buffered price %.4f > MAX_ENTRY_PRICE_ABS %.2f — rejecting",
+                                   buffered_price, MAX_ENTRY_PRICE_ABS)
                     return {
-                        "success": False, "order_id": None, "status": "edge_too_thin_after_buffer",
+                        "success": False, "order_id": None, "status": "price_too_high",
                         "filled_size": 0, "intended_size": size_usd, "fill_ratio": 0, "slippage": 0,
-                        "edge_after_buffer": edge_after_buffer,
                     }
 
-            # Recalculate fee using buffered price (informational logging only).
-            fee = (
-                (amount / buffered_price) * POLY_CRYPTO_FEE_RATE * buffered_price * (1 - buffered_price)
-                if buffered_price > 0 else 0
-            )
-            logger.info("Fee at buffered price: $%.4f (%.2f%%)", fee, (fee / amount * 100) if amount > 0 else 0)
+                if estimated_prob is not None:
+                    edge_after_buffer = estimated_prob - buffered_price
+                    logger.info(
+                        "Edge after buffer: est_prob=%.4f - buffered=%.4f = edge=%.4f (min_post_buffer=%.2f)",
+                        estimated_prob, buffered_price, edge_after_buffer, MIN_EDGE_POST_BUFFER,
+                    )
+                    if edge_after_buffer < MIN_EDGE_POST_BUFFER:
+                        logger.info(
+                            "SKIPPED: edge_after_buffer=%.4f < MIN_EDGE_POST_BUFFER=%.2f — buffer eats the edge",
+                            edge_after_buffer, MIN_EDGE_POST_BUFFER,
+                        )
+                        return {
+                            "success": False, "order_id": None, "status": "edge_too_thin_after_buffer",
+                            "filled_size": 0, "intended_size": size_usd, "fill_ratio": 0, "slippage": 0,
+                            "edge_after_buffer": edge_after_buffer,
+                        }
 
-            rounded_price = buffered_price
-            logger.info("Placing market order: %s $%.2f @ %.4f (ask=%.4f + buffer) | %s",
-                        side, amount, rounded_price, market_ask, market_slug)
+                fee = (
+                    (amount / buffered_price) * POLY_CRYPTO_FEE_RATE * buffered_price * (1 - buffered_price)
+                    if buffered_price > 0 else 0
+                )
+                logger.info("Fee at buffered price: $%.4f (%.2f%%)",
+                            fee, (fee / amount * 100) if amount > 0 else 0)
 
-            # V2 MarketOrderArgs no longer carries feeRateBps; the server
-            # applies the schedule for the token. The `side` field accepts
-            # the literal string "BUY"/"SELL" or the Side enum — string
-            # form keeps the rest of the codebase unchanged.
+                rounded_price = buffered_price
+                intended_amount = size_usd
+                logger.info("Placing market order: BUY $%.2f @ %.4f (ask=%.4f + buffer) | %s",
+                            amount, rounded_price, market_ask, market_slug)
+
+            else:  # SELL
+                # For SELLs: amount is shares; price is the bid we'll accept.
+                # We round shares down (round_down semantics) to avoid
+                # quoting more shares than we own due to floating-point.
+                # No price buffer — the position monitor already chose this
+                # bid level; degrading further would silently book worse fills.
+                amount = round(shares, 2)
+                if amount <= 0:
+                    return {"success": False, "status": "zero_shares",
+                            "filled_size": 0, "intended_size": shares, "fill_ratio": 0}
+                rounded_price = round(price, 2)
+                # Bound the limit price to the legal tick range.
+                if rounded_price <= 0 or rounded_price >= 1:
+                    return {"success": False, "status": "invalid_price",
+                            "filled_size": 0, "intended_size": shares, "fill_ratio": 0}
+                intended_amount = shares
+                logger.info("Placing market order: SELL %.4f shares @ %.4f | %s",
+                            amount, rounded_price, market_slug)
+
+            # V2 MarketOrderArgs: feeRateBps removed; server resolves the
+            # fee schedule. Side accepts "BUY"/"SELL" string or Side enum.
             order_args = MarketOrderArgs(
                 token_id=token_id,
                 amount=amount,
                 price=rounded_price,
-                side=side,
+                side=side_norm,
                 order_type=OrderType.FAK,
             )
 
             signed_order = self.client.create_market_order(order_args)
-            # V2 renamed the kwarg from orderType to order_type.
+            # V2 renamed the kwarg orderType -> order_type.
             result = self.client.post_order(signed_order, order_type=OrderType.FAK)
 
             order_id = result.get("orderID", result.get("id", "unknown"))
             status = result.get("status", "unknown")
 
-            # ── Track actual fill amounts from FAK orders ──
-            # CLOB response keys: makingAmount (USDC paid), takingAmount (shares),
-            # status ("matched" = filled), success (True/False)
-            intended_amount = size_usd
+            # ── Track actual fill amounts ──
+            # CLOB response keys: makingAmount, takingAmount, status, success.
+            # For BUY: maker = USDC spent, taker = shares received.
+            # For SELL: maker = shares sold, taker = USDC received.
             is_success = result.get("success", False)
             matched = result.get("status", "") == "matched"
 
+            try:
+                making = float(result.get("makingAmount", 0) or 0)
+                taking = float(result.get("takingAmount", 0) or 0)
+            except (ValueError, TypeError):
+                making = taking = 0.0
+
+            if side_norm == "BUY":
+                # filled_amount expressed in USDC (what we spent)
+                filled_amount = making if making > 0 else (intended_amount if (is_success and matched) else 0.0)
+                # taking is shares received
+                taking_amount = taking
+            else:  # SELL
+                # filled_amount expressed in shares (what we sold)
+                filled_amount = making if making > 0 else (intended_amount if (is_success and matched) else 0.0)
+                # taking is USDC received
+                taking_amount = taking
+
             if is_success and matched:
-                # Order filled — makingAmount = USDC paid (for BUY)
-                making = result.get("makingAmount", "0")
-                filled_amount = float(making) if making else 0.0
-                if filled_amount <= 0:
-                    filled_amount = intended_amount  # fallback — success=True means it filled
-                logger.info("Order FILLED: makingAmount=%s takingAmount=%s txns=%s",
-                            making, result.get("takingAmount", "0"),
+                logger.info("Order FILLED: side=%s makingAmount=%s takingAmount=%s txns=%s",
+                            side_norm, making, taking,
                             result.get("transactionsHashes", []))
             else:
                 # Not matched — try legacy keys as fallback
@@ -294,8 +334,9 @@ class PolymarketTrader:
 
             fill_ratio = filled_amount / intended_amount if intended_amount > 0 else 0
 
-            logger.info("Fill ratio: %.1f%% (filled $%.2f of $%.2f)",
-                        fill_ratio * 100, filled_amount, intended_amount)
+            unit = "USDC" if side_norm == "BUY" else "shares"
+            logger.info("Fill ratio: %.1f%% (filled %.4f of %.4f %s)",
+                        fill_ratio * 100, filled_amount, intended_amount, unit)
 
             append_jsonl(TRADE_LOG, {
                 "timestamp": time.time(),
@@ -303,11 +344,11 @@ class PolymarketTrader:
                 "order_id": order_id,
                 "status": status,
                 "token_id": token_id,
-                "side": side,
-                "size_usd": size_usd,
-                "market_ask": market_ask,
-                "buffered_price": buffered_price,
-                "price_buffer": PRICE_BUFFER,
+                "side": side_norm,
+                # USDC field carries the USDC leg regardless of side
+                # (BUY: USDC spent, SELL: USDC received).
+                "size_usd": (filled_amount if side_norm == "BUY" else taking_amount),
+                "shares": (taking_amount if side_norm == "BUY" else filled_amount),
                 "market_slug": market_slug,
                 "filled_size": filled_amount,
                 "intended_size": intended_amount,
@@ -317,22 +358,22 @@ class PolymarketTrader:
             })
 
             logger.info("Order result: id=%s status=%s", order_id, status)
-            # Pull takingAmount (shares filled) structurally — avoids the
-            # fragile regex parse on truncated str(result) in settlement.
-            try:
-                taking_amount = float(result.get("takingAmount", 0) or 0)
-            except (ValueError, TypeError):
-                taking_amount = 0.0
             return {
-                "success": status not in ("error", "failed"),
+                "success": status not in ("error", "failed") and is_success and matched,
                 "order_id": order_id,
                 "status": status,
                 "filled_size": filled_amount,
                 "intended_size": intended_amount,
                 "fill_ratio": fill_ratio,
                 "slippage": 0,
-                "avg_price": price,
+                "avg_price": rounded_price,
                 "taking_amount": taking_amount,
+                "side": side_norm,
+                # Convenience: USDC leg of the trade (positive for BUY = spent,
+                # positive for SELL = received) so callers can always read
+                # one consistent field.
+                "filled_usdc": filled_amount if side_norm == "BUY" else taking_amount,
+                "filled_shares": taking_amount if side_norm == "BUY" else filled_amount,
             }
 
         except Exception as e:
@@ -343,8 +384,6 @@ class PolymarketTrader:
             oid_match = _re.search(r'orderID.*?(0x[a-fA-F0-9]{20,})', error_str)
             extracted_oid = oid_match.group(1) if oid_match else None
             if "no orders found to match" in error_str:
-                # FAK order had no matching liquidity at this price — this is
-                # expected behaviour, NOT an error.  Log and move on.
                 logger.info(
                     "FAK order not filled — no liquidity at %.4f for %s (orderID=%s). Moving on.",
                     price, market_slug, extracted_oid or "unknown",
@@ -354,8 +393,9 @@ class PolymarketTrader:
                     "type": "order_no_fill",
                     "order_id": extracted_oid,
                     "token_id": token_id,
-                    "side": side,
-                    "size_usd": size_usd,
+                    "side": side_norm,
+                    "size_usd": size_usd if side_norm == "BUY" else 0,
+                    "shares": shares if side_norm == "SELL" else 0,
                     "price": price,
                     "market_slug": market_slug,
                     "reason": "FAK_no_liquidity",
@@ -365,10 +405,11 @@ class PolymarketTrader:
                     "order_id": extracted_oid,
                     "status": "no_fill",
                     "filled_size": 0,
-                    "intended_size": size_usd,
+                    "intended_size": (size_usd if side_norm == "BUY" else shares),
                     "fill_ratio": 0,
                     "slippage": 0,
                     "avg_price": price,
+                    "side": side_norm,
                 }
             log_error(f"Order placement failed: {e}", e)
             append_jsonl(TRADE_LOG, {
@@ -376,15 +417,86 @@ class PolymarketTrader:
                 "type": "order_error",
                 "error": error_str,
                 "token_id": token_id,
-                "side": side,
-                "size_usd": size_usd,
+                "side": side_norm,
+                "size_usd": size_usd if side_norm == "BUY" else 0,
+                "shares": shares if side_norm == "SELL" else 0,
             })
             return {
                 "success": False,
                 "order_id": extracted_oid,
                 "status": "exception",
                 "error": error_str,
+                "side": side_norm,
             }
+
+    # ── On-chain reconciliation (Priority 3) ──────────────────────────
+    async def fetch_realized_pnl(self) -> dict:
+        """Pull realized P&L straight from Polymarket's data-api.
+
+        The bot's internal `real_pnl_total` previously summed the bot's
+        OWN settlement inferences, which double-counted TP fantasies and
+        mis-inferred close prices (see 2026-04-29 03:05 incident). This
+        method instead asks the data-api for the wallet's actual Buys
+        and Redeems and returns the on-chain realized P&L. Caller is
+        expected to overwrite `self.real_pnl_total` with this value.
+
+        Returns dict with: realized_pnl, total_buys_usd, total_redeems_usd,
+        total_sells_usd, n_buys, n_redeems, n_sells, n_deposits.
+        """
+        from config import FUNDER_ADDRESS
+        import httpx as _httpx
+
+        url = "https://data-api.polymarket.com/activity"
+        params = {
+            "user": FUNDER_ADDRESS,
+            # data-api currently caps `limit` at ~500. The bot has
+            # 100-200 trades/day so a 1000-row pull covers ~5 days, well
+            # over the daily-reset window. If you ever need more, add
+            # pagination via `offset`.
+            "limit": 1000,
+        }
+        try:
+            async with _httpx.AsyncClient(timeout=15) as c:
+                r = await c.get(url, params=params)
+                r.raise_for_status()
+                events = r.json()
+        except Exception as e:
+            log_error(f"data-api activity fetch failed: {e}", e)
+            return {"error": str(e)}
+
+        total_buys = 0.0
+        total_redeems = 0.0
+        total_sells = 0.0
+        n_buys = n_redeems = n_sells = n_deposits = 0
+        for ev in events:
+            etype = (ev.get("type") or ev.get("eventType") or "").upper()
+            usdc = float(ev.get("usdcSize", ev.get("usdcAmount", 0) or 0))
+            if etype in ("TRADE", "BUY"):
+                # Field name across Polymarket APIs: side may be "BUY"/"SELL"
+                side = (ev.get("side") or "").upper()
+                if side == "BUY":
+                    total_buys += usdc
+                    n_buys += 1
+                elif side == "SELL":
+                    total_sells += usdc
+                    n_sells += 1
+            elif etype == "REDEEM":
+                total_redeems += usdc
+                n_redeems += 1
+            elif etype == "DEPOSIT":
+                n_deposits += 1
+        realized = total_redeems + total_sells - total_buys
+        return {
+            "realized_pnl": realized,
+            "total_buys_usd": total_buys,
+            "total_redeems_usd": total_redeems,
+            "total_sells_usd": total_sells,
+            "n_buys": n_buys,
+            "n_redeems": n_redeems,
+            "n_sells": n_sells,
+            "n_deposits": n_deposits,
+            "events_seen": len(events),
+        }
 
     async def get_open_orders(self) -> list:
         """Get open/live orders."""
